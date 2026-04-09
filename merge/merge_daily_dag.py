@@ -248,31 +248,40 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
 
     backup_target_path = f"{backup_path}/{part1_column}={target_date}"
 
-    try:
-        subprocess.run(["hdfs", "dfs", "-mkdir", "-p", backup_path], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        raise AirflowFailException(f"backup 디렉토리 생성 실패: {e.stderr}")
+    temp_exists = subprocess.run(
+        ["hdfs", "dfs", "-test", "-e", temp_target_path],
+        capture_output=True
+    ).returncode == 0
 
-    try:
-        subprocess.run(["hdfs", "dfs", "-mv", base_target_path, backup_path], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        raise AirflowFailException(f"base→backup 이동 실패: {e.stderr}")
-    try:
-        subprocess.run(["hdfs", "dfs", "-mv", temp_target_path, base_path], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        log.error(f"temp→base 이동 실패, 롤백 시도: {e.stderr}")
+    if not temp_exists:
+        log.info(f"temp 경로가 존재하지 않음, 이미 swap 완료된 것으로 판단하고 refresh로 진행: {temp_target_path}")
+    else:
         try:
-            subprocess.run(["hdfs", "dfs", "-mv", backup_target_path, base_path], check=True, capture_output=True, text=True)
-            log.info(f"롤백 완료: {backup_target_path} -> {base_path}")
-        except subprocess.CalledProcessError as rollback_e:
-            log.warning(
-                f"롤백 실패 - 수동 복구 필요. 아래 명령어를 순서대로 실행하세요:\n"
-                f"  1. hdfs dfs -mv {backup_target_path} {base_path}\n"
-                f"  2. hdfs dfs -rm -r {temp_target_path}  # 병합 결과 정리 (선택)\n"
-                f"롤백 실패 원인: {rollback_e.stderr}"
-            )
-        raise AirflowFailException(f"HDFS swap 실패: {e.stderr}")
-    log.info(f"hdfs swap complete: {base_target_path} -> {backup_path}, {temp_target_path} -> {base_path}")
+            subprocess.run(["hdfs", "dfs", "-mkdir", "-p", backup_path], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise AirflowFailException(f"backup 디렉토리 생성 실패: {e.stderr}")
+
+        try:
+            subprocess.run(["hdfs", "dfs", "-mv", base_target_path, backup_path], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise AirflowFailException(f"base→backup 이동 실패: {e.stderr}")
+
+        try:
+            subprocess.run(["hdfs", "dfs", "-mv", temp_target_path, base_path], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            log.error(f"temp→base 이동 실패, 롤백 시도: {e.stderr}")
+            try:
+                subprocess.run(["hdfs", "dfs", "-mv", backup_target_path, base_path], check=True, capture_output=True, text=True)
+                log.info(f"롤백 완료: {backup_target_path} -> {base_path}")
+            except subprocess.CalledProcessError as rollback_e:
+                log.warning(
+                    f"롤백 실패 - 수동 복구 필요. 아래 명령어를 순서대로 실행하세요:\n"
+                    f"  1. hdfs dfs -mv {backup_target_path} {base_path}\n"
+                    f"  2. hdfs dfs -rm -r {temp_target_path}  # 병합 결과 정리 (선택)\n"
+                    f"롤백 실패 원인: {rollback_e.stderr}"
+                )
+            raise AirflowFailException(f"HDFS swap 실패: {e.stderr}")
+        log.info(f"hdfs swap complete: {base_target_path} -> {backup_path}, {temp_target_path} -> {base_path}")
 
     def _refresh_partition(cluster):
         max_retries = 3
