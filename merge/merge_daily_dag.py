@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException, AirflowException
-from airflow.operators.python import get_current_context
 from livy import LivyBatch, SessionState
 
 from postgres_wrapper import postgres_query
@@ -48,10 +47,7 @@ def load_refresh_flags_task():
 
 
 @task
-def get_metadata_task(table_config):
-    context = get_current_context()
-    data_interval_end = context['data_interval_end']
-
+def get_metadata_task(table_config, data_interval_end=None):
     table_id = table_config['table_id']
 
     query = f"""select db, table_name, save_path, partitions, domain
@@ -186,10 +182,20 @@ def livy_task(metadata):
         raise AirflowFailException(f"Livy 배치 제출 실패 또는 RUNNING 상태 미달: {batch_name}")
 
     time.sleep(5)
-    (livy_batch_id, livy_state) = get_livy_batch_id_by_name(batch_name, "livy_cluster")
+    try:
+        (livy_batch_id, livy_state) = get_livy_batch_id_by_name(batch_name, "livy_cluster")
+    except Exception as e:
+        raise AirflowFailException(f"Livy API 오류로 batch ID 조회 실패: {batch_name}: {e}")
+
+    if livy_batch_id == -1:
+        raise AirflowFailException(f"Livy batch를 찾을 수 없습니다: {batch_name}")
+
     log.info(f"livy batch id: {livy_batch_id}, initial state: {livy_state}")
 
     livy_batch_obj = get_livy_batch_by_id(livy_batch_id, "livy_cluster")
+    if livy_batch_obj is None:
+        raise AirflowFailException(f"Livy batch 객체 조회 실패 (id={livy_batch_id})")
+
     livy_batch_obj.wait()
     final_state = livy_batch_obj.state
     log.info(f"livy batch final state: {final_state}")
