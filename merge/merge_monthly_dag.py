@@ -15,10 +15,10 @@ Small File Merge Monthly DAG
     load_refresh_flags
         └─ [테이블별 table_group]
             ├─ get_metadata_task
-            ├─ impala_health_check_task  (merge_daily_dag에서 import)
+            ├─ impala_health_check_task
             ├─ count_before (log_before_count_task)
             ├─ livy_task
-            ├─ get_partitions_task       (merge_daily_dag에서 import)
+            ├─ get_partitions_task
             └─ swap_refresh_task[0..N-1] (날짜별 동적 확장)
 
 Airflow UI:
@@ -29,29 +29,25 @@ Airflow UI:
 import os
 import sys
 
-# merge/ 디렉토리를 sys.path에 추가하여 merge_daily_dag와 tasks 패키지를 참조 가능하게 한다.
+# merge/ 디렉토리를 sys.path에 추가하여 tasks 패키지를 참조 가능하게 한다.
 _merge_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_merge_dir, '..', 'common'))  # common 래퍼
-sys.path.insert(0, _merge_dir)                                 # tasks 패키지 및 merge_daily_dag
+sys.path.insert(0, _merge_dir)                                 # tasks 패키지
 
 from airflow.decorators import dag, task_group
 from airflow.models import Variable
 from airflow.utils.weight_rule import WeightRule
 
-# 완전히 동일한 태스크는 merge_daily_dag에서 직접 import하여 재사용한다.
-# 주의: merge_daily_dag를 import하면 해당 DAG도 Airflow에 등록된다. (정상 동작)
-from merge_daily_dag import (
+# 모든 태스크는 tasks/monthly_tasks.py에서 import한다.
+# daily DAG와 완전히 분리하여 merge_daily_dag를 직접 import하지 않는다.
+from tasks.monthly_tasks import (
+    dag_failure_alarm,
     load_refresh_flags_task,
     impala_health_check_task,
-    get_partitions_task,
-    dag_failure_alarm,
-)
-
-# 월별 전용 태스크는 tasks/monthly_tasks.py에서 import한다.
-from tasks.monthly_tasks import (
     get_metadata_task,
     log_before_count_task,
     livy_task,
+    get_partitions_task,
     swap_refresh_task,
 )
 

@@ -1,10 +1,9 @@
 """
 월별 소파일 병합 DAG 전용 태스크 모음
 
-merge_daily_dag.py의 태스크와 동일한 로직은 주석으로 표기.
-이 모듈의 상수(pg_conn_id, DOMAIN_PATH_MAP 등)는 merge_daily_dag에서 import하지 않고
-의도적으로 중복 선언한다. merge_daily_dag를 import하면 daily DAG가 Airflow에 재등록되는
-부작용이 발생할 수 있기 때문이다.
+daily DAG와 코드 내용은 동일하더라도 merge_daily_dag.py를 직접 import하지 않는다.
+daily/monthly DAG는 완전히 독립 실행되며, import 시 daily DAG가 Airflow에 재등록되는
+부작용이 발생하기 때문이다.
 """
 
 import os
@@ -22,24 +21,169 @@ import pendulum
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'common'))
 
 from airflow.decorators import task
+from airflow.models import Variable
 from airflow.exceptions import AirflowFailException, AirflowException, AirflowSkipException
 
 from postgres_wrapper import postgres_query
 from impyla_wrapper import impala_query
 from livy_wrapper import create_livy_batch, get_livy_batch_id_by_name, get_livy_batch_by_id
 from livy import SessionState
+from alarm_wrapper import send_alarm
 
 log = logging.getLogger(__name__)
 
-# merge_daily_dag와 동일한 값이지만 import 부작용을 피하기 위해 중복 선언
+# daily DAG와 동일한 값이지만 독립성 유지를 위해 중복 선언
+# 변경 시 merge_daily_dag.py의 동일 상수도 함께 수정할 것
 pg_conn_id = "pg"
 base_cluster = "cluster1"   # count 조회 기준 클러스터
+impala_refresh_variable = "refresh_flags"
 
 # 도메인별 HDFS base URL. 도메인 추가 시 merge_daily_dag.py의 동일 딕셔너리도 함께 수정할 것.
 DOMAIN_PATH_MAP = {
     "path1": "hdfs://path1.com/impala",
     "path2": "hdfs://path2.com/impala",
 }
+
+
+def dag_failure_alarm(context):
+    """
+    태스크 실패 시 Airflow가 자동으로 호출하는 콜백 함수.
+    실패 정보를 메시지로 구성하여 send_alarm으로 전달한다.
+    default_args의 on_failure_callback에 등록되어 모든 태스크에 적용된다.
+
+    Args:
+        context (dict): Airflow가 주입하는 실행 컨텍스트.
+                        dag, task_instance, exception, execution_date 등 포함.
+    """
+    dag_id = context['dag'].dag_id
+    task_id = context['task_instance'].task_id
+    execution_date = context['execution_date']  # TODO(Airflow 3): logical_date로 변경
+    exception = context.get('exception')
+    log_url = context['task_instance'].log_url
+
+    message = (
+        f"[DAG 실패 알람]\n"
+        f"DAG: {dag_id}\n"
+        f"Task: {task_id}\n"
+        f"실행일시: {execution_date}\n"
+        f"오류: {exception}\n"
+        f"로그: {log_url}"
+    )
+
+    send_alarm(context, message=message)
+
+
+@task(retries=3, retry_delay=timedelta(seconds=10))
+def load_refresh_flags_task():
+    """
+    Airflow Variable에서 클러스터별 refresh 실행 여부를 로드한다.
+
+    Returns:
+        dict: {cluster_name: flag} 형태. flag=True인 클러스터만 이후 태스크에서 사용된다.
+              flag 필터링은 impala_health_check_task에서 수행한다.
+
+    Variable 형식 예시:
+        [{"cluster": "cluster1", "flag": true}, {"cluster": "cluster2", "flag": false}]
+    """
+    try:
+        refresh_flags = Variable.get(impala_refresh_variable, deserialize_json=True)
+    except Exception as e:
+        raise AirflowFailException(f"Variable '{impala_refresh_variable}' 로드 실패: {e}")
+
+    result = {item['cluster']: item['flag'] for item in refresh_flags}
+
+    if not result:
+        raise AirflowFailException(f"'{impala_refresh_variable}' Variable이 비어 있습니다.")
+
+    active = [c for c, f in result.items() if f]
+    inactive = [c for c, f in result.items() if not f]
+    log.info(f"refresh 대상 클러스터: {active}")
+    if inactive:
+        log.info(f"refresh 비활성 클러스터 (skip): {inactive}")
+
+    return result
+
+
+@task(retries=3, retry_delay=timedelta(seconds=10))
+def impala_health_check_task(metadata, refresh_flags):
+    """
+    refresh_flags에서 flag=True인 클러스터에 대해 Impala 연결 및 테이블 존재 여부를 확인한다.
+    하나의 클러스터라도 실패하면 전체 태스크를 실패 처리한다.
+
+    Args:
+        metadata (dict): get_metadata_task 반환값.
+        refresh_flags (dict): {cluster_name: flag} 형태.
+
+    Returns:
+        list: health check를 통과한 클러스터 이름 목록.
+              이후 swap_refresh_task에서 refresh 대상 클러스터로 사용된다.
+    """
+    db_name = metadata['db_name']
+    table_name = metadata['table_name']
+
+    # Impala에서는 테이블명 뒤에 '_t' suffix를 붙여 관리한다.
+    query = f"show tables in {db_name} like '{table_name}_t'"
+
+    passed_clusters = []
+    failed_clusters = {}
+
+    for cluster, is_active in refresh_flags.items():
+        if not is_active:
+            continue
+        result_df = impala_query(query, cluster, True)
+        if result_df is None:
+            failed_clusters[cluster] = "impala connect failed"
+        elif result_df.empty:
+            failed_clusters[cluster] = "table not exist"
+        else:
+            passed_clusters.append(cluster)
+
+    if failed_clusters:
+        log.error(f"health check 실패 클러스터: {failed_clusters}")
+        raise AirflowFailException("health check failed")
+
+    if not passed_clusters:
+        raise AirflowFailException("active 클러스터가 없습니다. refresh_flags Variable을 확인하세요.")
+
+    log.info(f"health check 통과 클러스터: {passed_clusters}")
+    return passed_clusters
+
+
+@task
+def get_partitions_task(metadata):
+    """
+    Spark 작업이 temp 경로에 생성한 manifest 파일을 읽어 파티션 목록을 반환한다.
+    manifest는 1줄 1 JSON 형식이며, 파티션 컬럼 순서가 보장된 상태로 저장된다.
+
+    Returns:
+        list[dict]: 파티션 정보 목록. 예: [{"dt": "2024-01-01", "hour": "00"}, ...]
+                    swap_refresh_task에서 Impala refresh 쿼리 생성에 사용된다.
+    """
+    manifest_path = f"{metadata['temp_path']}/manifest/*.json"
+
+    try:
+        manifest_json = subprocess.run(
+            ["hdfs", "dfs", "-cat", manifest_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise AirflowFailException(f"manifest HDFS 읽기 실패: {e.stderr}")
+    except Exception as e:
+        raise AirflowFailException(f"manifest 읽기 실패: {e}")
+
+    try:
+        partition_list = [json.loads(line) for line in manifest_json.stdout.splitlines() if line.strip()]
+    except Exception as e:
+        raise AirflowFailException(f"manifest JSON 파싱 실패: {e}")
+
+    if not partition_list:
+        raise AirflowFailException(f"manifest가 비어있습니다. Spark 작업 결과를 확인하세요: {manifest_path}")
+
+    log.info(f"manifest 파티션 {len(partition_list)}개 로드 완료: {partition_list}")
+
+    return partition_list
 
 
 @task

@@ -62,17 +62,19 @@ load_refresh_flags_task
 ## DAG 흐름 (월별)
 
 ```
-load_refresh_flags_task  ← merge_daily_dag에서 import
+load_refresh_flags_task
     └─ for each table_config:
         table_group_monthly
-            ├─ get_metadata_task       ← tasks/monthly_tasks.py
-            ├─ impala_health_check_task ← merge_daily_dag에서 import
-            ├─ count_before (log_before_count_task) ← tasks/monthly_tasks.py
-            ├─ livy_task               ← tasks/monthly_tasks.py
-            ├─ get_partitions_task     ← merge_daily_dag에서 import
+            ├─ get_metadata_task
+            ├─ impala_health_check_task
+            ├─ count_before (log_before_count_task)
+            ├─ livy_task
+            ├─ get_partitions_task
             └─ swap_refresh_task.partial().expand(target_date=target_date_list)
-                                       ← tasks/monthly_tasks.py (날짜별 동적 확장)
+                                       (날짜별 동적 확장)
 ```
+
+모든 태스크는 `tasks/monthly_tasks.py`에서 관리. `merge_daily_dag`를 직접 import하지 않는다.
 
 ## 태스크별 retry 설정
 
