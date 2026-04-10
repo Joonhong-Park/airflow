@@ -7,7 +7,9 @@
 | 파일 | 역할 |
 |---|---|
 | `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily`) |
-| `plan_monthly_merge_dag.md` | 월별 병합 DAG 구현 계획 |
+| `tasks/monthly_tasks.py` | 월별 DAG 전용 공통 태스크 |
+| `merge_monthly_dag.py` | 월별 병합 DAG (`Small-File-Merge-Monthly-Day1`, `Day2`, ...) |
+| `tasks/__init__.py` | tasks 패키지 초기화 (빈 파일) |
 
 ## Airflow Variables
 
@@ -15,7 +17,7 @@
 |---|---|---|
 | `refresh_flags` | JSON array | 클러스터별 refresh 실행 여부 (`[{"cluster": "...", "flag": true}]`) |
 | `daily_merge_table_config` | JSON array | 일별 병합 테이블 설정 |
-| `monthly_merge_table_config` | JSON array | 월별 병합 테이블 설정 (`months_ago` 사용) |
+| `monthly_merge_table_config_day{N}` | JSON array | 월별 병합 테이블 설정 (N일 실행, N=1,2,3,...) |
 
 ## 테이블 설정 스키마
 
@@ -30,7 +32,7 @@
   }
 ]
 
-// monthly_merge_table_config
+// monthly_merge_table_config_day1 / day2
 [
   {
     "table_id": 1,
@@ -57,6 +59,21 @@ load_refresh_flags_task
 
 태스크 의존 순서: `get_metadata_task → impala_health_check_task → count_before → livy_task → get_partitions_task → swap_refresh_task`
 
+## DAG 흐름 (월별)
+
+```
+load_refresh_flags_task  ← merge_daily_dag에서 import
+    └─ for each table_config:
+        table_group_monthly
+            ├─ get_metadata_task       ← tasks/monthly_tasks.py
+            ├─ impala_health_check_task ← merge_daily_dag에서 import
+            ├─ count_before (log_before_count_task) ← tasks/monthly_tasks.py
+            ├─ livy_task               ← tasks/monthly_tasks.py
+            ├─ get_partitions_task     ← merge_daily_dag에서 import
+            └─ swap_refresh_task.partial().expand(target_date=target_date_list)
+                                       ← tasks/monthly_tasks.py (날짜별 동적 확장)
+```
+
 ## 태스크별 retry 설정
 
 | 태스크 | retries | retry_delay |
@@ -66,13 +83,23 @@ load_refresh_flags_task
 | `log_before_count_task` | 3 | 10s |
 | `livy_task` | 3 | 3min |
 
+## 월별 DAG 동시 실행 제한
+
+월별 DAG는 `max_active_tis_per_dag` 파라미터로 태스크별 동시 실행 수를 제한한다. (Airflow 2.2+, 외부 리소스 생성 불필요)
+
+| 태스크 | max_active_tis_per_dag | 설명 |
+|---|---|---|
+| `livy_task` | 5 | 동시 처리 테이블 수 제한 (Livy가 테이블당 가장 오래 실행되는 태스크) |
+| `swap_refresh_task` | 10 | 날짜별 동적 확장 인스턴스 동시 실행 수 제한 |
+
 ## HDFS 경로 구조
 
 - **base path**: `{domain_path}{save_path}/{table_name}` (`save_path`는 `/`로 시작)
 - **temp path**: `hdfs://temp_path.com/impala/merge/temp/{table_name}`
 - **backup path**: `hdfs://temp_path.com/impala/merge/backup/{table_name}`
 
-swap 순서: `base → backup` 이동 후 `temp → base` 이동. 실패 시 `backup → base` 롤백.
+swap 순서: `base → backup` 이동 후 `temp → base` 이동. 실패 시 `backup → base` 롤백.  
+retry 시 temp 경로 존재 여부로 swap 완료 판단 → 미존재 시 refresh 단계로 바로 진행.
 
 ## domain → HDFS path 매핑
 
@@ -87,16 +114,32 @@ DOMAIN_PATH_MAP = {
 
 ## refresh_flags 처리 방식
 
-- `load_refresh_flags_task`: 전체 클러스터를 `{cluster: flag}` 딕셔너리로 반환
+- `load_refresh_flags_task`: 전체 클러스터를 `{cluster: flag}` 딕셔너리로 반환 (active 클러스터 없으면 fail)
 - `impala_health_check_task`: `flag=False`인 클러스터는 skip, `flag=True`인 클러스터만 health check 수행
+
+## count_before 처리 방식
+
+- **일별**: 단일 날짜 `count(*)` 조회 → `merge_log` 1건 upsert
+- **월별**: `GROUP BY` 날짜별 조회 → 날짜별 `merge_log` upsert
+- count=0이면 이후 태스크 전체 `AirflowSkipException`으로 skip
+- upsert 시 `before_count`만 갱신, `after_count`는 건드리지 않음 (retry/backfill 시 보존)
+
+## Airflow 3 마이그레이션 시 수정 필요 항목
+
+현재 Airflow 2 기준으로 작성. Airflow 3 전환 시 아래 항목 수정 필요.
+
+| 항목 | 현재 (Airflow 2) | 변경 후 (Airflow 3) |
+|---|---|---|
+| `data_interval_end.in_timezone()` | pendulum 2 메서드 | `in_tz()`로 변경 (pendulum 3) |
+| `pendulum.period` | `tasks/monthly_tasks.py` 사용 | `pendulum.interval`로 변경 (pendulum 3) |
 
 ## 주의사항
 
-- 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요
+- 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요 (월별은 새벽 1시 실행)
+- 동일 테이블이 여러 day Variable에 중복 등록되지 않도록 운영 관리 필요 (dayN까지 확장 가능, DAG 추가 시 `create_monthly_dag()` 한 줄 추가)
 - `swap_refresh_task` 내 Impala refresh는 클러스터별 병렬 실행 (`ThreadPoolExecutor`)
 - `livy_task`에서 `create_livy_batch` 후 `time.sleep(5)` 후 ID 조회 — Livy 등록 지연 대응
-- `livy_task` retry 시 동명 배치(`Small-file-merge-daily-{table_name}`)가 Livy에 잔존할 수 있으므로 `create_livy_batch` wrapper의 중복 처리 방식 확인 필요
-- `merge_log` upsert 시 `after_count`는 갱신하지 않음 — retry/backfill 시 기존 after_count 보존
-- 월별 DAG에서 `swap_refresh_task`는 `.partial().expand(target_date=target_date_list)`로 날짜별 동적 확장
+- `livy_task` retry 시 동명 배치가 Livy에 잔존할 수 있으므로 `create_livy_batch` wrapper의 중복 처리 방식 확인 필요
 - `task_group` 내부에 `expand()`가 있으므로 `task_group` 자체를 `expand_kwargs()`로 중첩 매핑하면 Airflow 2.x 미지원
+- `metadata['target_date_list']` XComArg subscript는 Airflow 2.3+ 지원
 - PostgreSQL 테이블: `table_meta`(메타정보), `merge_log`(before/after count 기록)

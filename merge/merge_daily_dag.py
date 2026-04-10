@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException, AirflowException, AirflowSkipException
-from livy import LivyBatch, SessionState
+from airflow.utils.weight_rule import WeightRule
+from livy import SessionState
 
 from postgres_wrapper import postgres_query
 from impyla_wrapper import impala_query
@@ -127,8 +128,10 @@ def get_metadata_task(table_config, data_interval_end=None):
     backup_full_path = f"hdfs://temp_path.com/impala/merge/backup/{table_name}"
 
     # data_interval_end 기준으로 KST 변환 후 days_ago만큼 빼서 target_date 계산
-    run_date = data_interval_end.in_timezone('Asia/Seoul')
-    days_ago = table_config['days_ago']
+    run_date = data_interval_end.in_timezone('Asia/Seoul')  # TODO(Airflow 3): in_timezone() → in_tz() (pendulum 3)
+    days_ago = table_config.get('days_ago')
+    if days_ago is None:
+        raise AirflowFailException(f"table_config에 'days_ago' 키가 없습니다. (table_id={table_id})")
     target_date = run_date.subtract(days=days_ago).to_date_string()
 
     metadata = {
@@ -190,6 +193,9 @@ def impala_health_check_task(metadata, refresh_flags):
         log.error(f"health check 실패 클러스터: {failed_clusters}")
         raise AirflowFailException("health check failed")
 
+    if not passed_clusters:
+        raise AirflowFailException("active 클러스터가 없습니다. refresh_flags Variable을 확인하세요.")
+
     log.info(f"health check 통과 클러스터: {passed_clusters}")
     return passed_clusters
 
@@ -198,7 +204,7 @@ def impala_health_check_task(metadata, refresh_flags):
 def log_before_count_task(metadata):
     """
     병합 전 target_date 파티션의 row count를 조회하여 merge_log에 기록한다.
-    count가 0이면 데이터 미적재 상태로 판단하여 즉시 실패 처리한다.
+    count가 0이면 병합 대상 데이터가 없는 것으로 판단하여 이후 태스크를 skip 처리한다.
 
     merge_log upsert 시 before_count만 갱신하며 after_count는 건드리지 않는다.
     retry/backfill 시 after_count가 초기화되는 것을 방지하기 위함이다.
@@ -261,6 +267,8 @@ def livy_task(metadata):
 
     if sort_columns:
         spark_args.extend(['--sort-columns', sort_columns])
+
+    log.info(f"Livy 배치 제출 시작 | batch_name: {batch_name} | args: {spark_args}")
 
     livy_status = create_livy_batch(
         name=batch_name,
@@ -448,9 +456,7 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
         for future in concurrent.futures.as_completed(future_map):
             cluster = future_map[future]
             try:
-                result = future.result()
-                if result is not None:
-                    cluster_count_dict.update(result)
+                cluster_count_dict.update(future.result())
             except Exception as e:
                 log.error(f"[{cluster}] refresh/count 실패: {e}")
                 failed_clusters.append(cluster)
@@ -502,7 +508,7 @@ def table_group(table_config, refresh_flags):
 @dag(
     dag_id='Small-File-Merge-Daily',
     schedule='@daily',
-    default_args={'depends_on_past': False, 'weight_rule': 'upstream'},
+    default_args={'depends_on_past': False, 'weight_rule': WeightRule.UPSTREAM},
     max_active_runs=1,      # 동일 DAG 중복 실행 방지
     max_active_tasks=10
 )
