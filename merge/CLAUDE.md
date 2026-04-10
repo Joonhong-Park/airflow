@@ -6,7 +6,7 @@
 
 | 파일 | 역할 |
 |---|---|
-| `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily`) |
+| `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily-2am`, `3am`, ...) |
 | `tasks/monthly_tasks.py` | 월별 DAG 전용 공통 태스크 |
 | `merge_monthly_dag.py` | 월별 병합 DAG (`Small-File-Merge-Monthly-Day1`, `Day2`, ...) |
 | `tasks/__init__.py` | tasks 패키지 초기화 (빈 파일) |
@@ -16,13 +16,13 @@
 | Variable | 형식 | 설명 |
 |---|---|---|
 | `refresh_flags` | JSON array | 클러스터별 refresh 실행 여부 (`[{"cluster": "...", "flag": true}]`) |
-| `daily_merge_table_config` | JSON array | 일별 병합 테이블 설정 |
+| `daily_table_{H}am_config` | JSON array | 일별 병합 테이블 설정 (H시 실행, 예: 2am, 3am) |
 | `monthly_merge_table_config_day{N}` | JSON array | 월별 병합 테이블 설정 (N일 실행, N=1,2,3,...) |
 
 ## 테이블 설정 스키마
 
 ```json
-// daily_merge_table_config
+// daily_table_2am_config / daily_table_3am_config / ...
 [
   {
     "table_id": 1,
@@ -135,7 +135,7 @@ DOMAIN_PATH_MAP = {
 
 ## 주의사항
 
-- 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요 (월별은 새벽 1시 실행)
+- 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요 (월별은 새벽 1시, 일별은 2시·3시 등으로 분리)
 - 동일 테이블이 여러 day Variable에 중복 등록되지 않도록 운영 관리 필요 (dayN까지 확장 가능, DAG 추가 시 `create_monthly_dag()` 한 줄 추가)
 - `swap_refresh_task` 내 Impala refresh는 클러스터별 병렬 실행 (`ThreadPoolExecutor`)
 - `livy_task`에서 `create_livy_batch` 후 `time.sleep(5)` 후 ID 조회 — Livy 등록 지연 대응

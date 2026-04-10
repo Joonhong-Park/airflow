@@ -5,6 +5,13 @@ Impala 테이블의 소파일을 날짜 파티션 단위로 병합한다.
 Spark 작업(Livy)으로 병합 결과를 temp 경로에 생성한 뒤,
 HDFS swap을 통해 base 경로와 교체하고 Impala partition refresh를 수행한다.
 
+실행 시각별로 DAG를 분리하여 테이블 목록을 분산 처리한다.
+    2am: Small-File-Merge-Daily-2am (daily_table_2am_config)
+    3am: Small-File-Merge-Daily-3am (daily_table_3am_config)
+    ...
+
+새 DAG 추가 시 파일 하단의 create_daily_dag() 호출을 한 줄 추가하면 된다.
+
 흐름:
     load_refresh_flags_task
         └─ [테이블별 table_group]
@@ -42,7 +49,6 @@ log = logging.getLogger(__name__)
 pg_conn_id = "pg"
 base_cluster = "cluster1"                          # count 조회 기준 클러스터
 impala_refresh_variable = "refresh_flags"
-table_config_variable = "daily_merge_table_config"
 
 # 도메인별 HDFS base URL. 도메인 추가 시 여기에만 추가하면 된다.
 DOMAIN_PATH_MAP = {
@@ -505,21 +511,48 @@ def table_group(table_config, refresh_flags):
     cluster_list >> log_before >> livy_job >> partition_list >> swap_refresh
 
 
-@dag(
-    dag_id='Small-File-Merge-Daily',
-    schedule='@daily',
-    default_args={'depends_on_past': False, 'weight_rule': WeightRule.UPSTREAM},
-    max_active_runs=1,      # 동일 DAG 중복 실행 방지
-    max_active_tasks=10
-)
-def daily_merge_dag():
-    refresh_flags_dict = load_refresh_flags_task()
-    table_config_list = Variable.get(table_config_variable, deserialize_json=True, default_var=[])
+def create_daily_dag(dag_id, config_variable, schedule):
+    """
+    일별 병합 DAG를 생성하는 팩토리 함수.
 
-    # Variable이 비어있으면 태스크 없이 DAG만 생성됨 (정상 동작)
-    for table_config in table_config_list:
-        table_id = table_config['table_id']
-        table_group.override(group_id=f"table_{table_id}")(table_config, refresh_flags_dict)
+    Args:
+        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Daily-2am'
+        config_variable (str): 테이블 설정을 담은 Airflow Variable 이름.
+                               예: 'daily_table_2am_config'
+        schedule (str): cron 표현식 또는 preset. 예: '0 2 * * *'
+
+    Returns:
+        DAG 인스턴스 (Airflow가 전역 스코프에서 자동 인식)
+
+    Variable 형식 예시:
+        [
+            {"table_id": 1, "days_ago": 1, "sort_columns": "col1,col2", "compression": "snappy"},
+            {"table_id": 2, "days_ago": 1, "compression": "zstd"}
+        ]
+    """
+    @dag(
+        dag_id=dag_id,
+        schedule=schedule,
+        default_args={'depends_on_past': False, 'weight_rule': WeightRule.UPSTREAM},
+        max_active_runs=1,      # 동일 DAG 중복 실행 방지
+        max_active_tasks=10
+    )
+    def daily_merge_dag():
+        refresh_flags_dict = load_refresh_flags_task()
+        table_config_list = Variable.get(config_variable, deserialize_json=True, default_var=[])
+
+        # Variable이 비어있으면 태스크 없이 DAG만 생성됨 (정상 동작)
+        for table_config in table_config_list:
+            table_id = table_config['table_id']
+            table_group.override(group_id=f"table_{table_id}")(table_config, refresh_flags_dict)
+
+    return daily_merge_dag()
 
 
-daily_merge_dag()
+# ─────────────────────────────────────────────────────────────────────────────
+# DAG 목록
+# 테이블이 많아 실행 시각을 분산할 경우 아래에 한 줄씩 추가한다.
+# 동일 테이블이 여러 Variable에 중복 등록되지 않도록 운영 관리 필요.
+# ─────────────────────────────────────────────────────────────────────────────
+create_daily_dag('Small-File-Merge-Daily-2am', 'daily_table_2am_config', '0 2 * * *')
+create_daily_dag('Small-File-Merge-Daily-3am', 'daily_table_3am_config', '0 3 * * *')
