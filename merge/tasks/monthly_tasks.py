@@ -377,9 +377,9 @@ def swap_refresh_task(cluster_list, partition_list, metadata, target_date):
                     break
                 except Exception as e:
                     log.warning(f"[{cluster}] partition refresh attempt {attempt}/{max_retries} failed: {e}")
-                    if attempt == max_retries:
-                        raise AirflowFailException(f"[{cluster}] partition refresh failed: {partition_spec}")
                     time.sleep(5)
+            else:
+                raise AirflowFailException(f"[{cluster}] partition refresh failed: {partition_spec}")
 
         # refresh 후 count 조회로 데이터 반영 확인
         for attempt in range(1, max_retries + 1):
@@ -390,9 +390,9 @@ def swap_refresh_task(cluster_list, partition_list, metadata, target_date):
                 return {cluster: count}
             except Exception as e:
                 log.warning(f"[{cluster}] count query attempt {attempt}/{max_retries} failed: {e}")
-                if attempt == max_retries:
-                    raise AirflowFailException(f"[{cluster}] count query failed after {max_retries} retries")
                 time.sleep(5)
+        else:
+            raise AirflowFailException(f"[{cluster}] count query failed after {max_retries} retries")
 
     # 클러스터별 병렬 refresh 실행
     cluster_count_dict = {}
