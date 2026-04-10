@@ -44,6 +44,7 @@ from merge_daily_dag import (
     load_refresh_flags_task,
     impala_health_check_task,
     get_partitions_task,
+    dag_failure_alarm,
 )
 
 # 월별 전용 태스크는 tasks/monthly_tasks.py에서 import한다.
@@ -105,7 +106,11 @@ def create_monthly_dag(dag_id, config_variable, schedule):
     @dag(
         dag_id=dag_id,
         schedule=schedule,
-        default_args={'depends_on_past': False, 'weight_rule': WeightRule.UPSTREAM},
+        default_args={
+            'depends_on_past': False,
+            'weight_rule': WeightRule.UPSTREAM,
+            'on_failure_callback': dag_failure_alarm,
+        },
         max_active_runs=1,      # 동일 DAG 중복 실행 방지
         max_active_tasks=10,
     )

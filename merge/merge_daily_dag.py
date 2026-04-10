@@ -43,8 +43,37 @@ from livy import SessionState
 from postgres_wrapper import postgres_query
 from impyla_wrapper import impala_query
 from livy_wrapper import create_livy_batch, get_livy_batch_id_by_name, get_livy_batch_by_id
+from alarm_wrapper import send_alarm
 
 log = logging.getLogger(__name__)
+
+def dag_failure_alarm(context):
+    """
+    태스크 실패 시 Airflow가 자동으로 호출하는 콜백 함수.
+    실패 정보를 메시지로 구성하여 send_alarm으로 전달한다.
+    default_args의 on_failure_callback에 등록되어 모든 태스크에 적용된다.
+
+    Args:
+        context (dict): Airflow가 주입하는 실행 컨텍스트.
+                        dag, task_instance, exception, execution_date 등 포함.
+    """
+    dag_id = context['dag'].dag_id
+    task_id = context['task_instance'].task_id
+    execution_date = context['execution_date']  # TODO(Airflow 3): logical_date로 변경
+    exception = context.get('exception')
+    log_url = context['task_instance'].log_url
+
+    message = (
+        f"[DAG 실패 알람]\n"
+        f"DAG: {dag_id}\n"
+        f"Task: {task_id}\n"
+        f"실행일시: {execution_date}\n"
+        f"오류: {exception}\n"
+        f"로그: {log_url}"
+    )
+
+    send_alarm(context, message=message)
+
 
 pg_conn_id = "pg"
 base_cluster = "cluster1"                          # count 조회 기준 클러스터
@@ -533,7 +562,11 @@ def create_daily_dag(dag_id, config_variable, schedule):
     @dag(
         dag_id=dag_id,
         schedule=schedule,
-        default_args={'depends_on_past': False, 'weight_rule': WeightRule.UPSTREAM},
+        default_args={
+            'depends_on_past': False,
+            'weight_rule': WeightRule.UPSTREAM,
+            'on_failure_callback': dag_failure_alarm,
+        },
         max_active_runs=1,      # 동일 DAG 중복 실행 방지
         max_active_tasks=10
     )
