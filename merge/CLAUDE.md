@@ -7,9 +7,7 @@
 | 파일 | 역할 |
 |---|---|
 | `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily-2am`, `3am`, ...) |
-| `tasks/monthly_tasks.py` | 월별 DAG 전용 공통 태스크 |
 | `merge_monthly_dag.py` | 월별 병합 DAG (`Small-File-Merge-Monthly-Day1`, `Day2`, ...) |
-| `tasks/__init__.py` | tasks 패키지 초기화 (빈 파일) |
 
 ## Airflow Variables
 
