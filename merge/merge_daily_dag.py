@@ -1,3 +1,21 @@
+"""
+Small File Merge Daily DAG
+
+Impala 테이블의 소파일을 날짜 파티션 단위로 병합한다.
+Spark 작업(Livy)으로 병합 결과를 temp 경로에 생성한 뒤,
+HDFS swap을 통해 base 경로와 교체하고 Impala partition refresh를 수행한다.
+
+흐름:
+    load_refresh_flags_task
+        └─ [테이블별 table_group]
+            ├─ get_metadata_task
+            ├─ impala_health_check_task
+            ├─ count_before (log_before_count_task)
+            ├─ livy_task
+            ├─ get_partitions_task
+            └─ swap_refresh_task
+"""
+
 import os
 import sys
 import subprocess
@@ -11,7 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
-from airflow.exceptions import AirflowFailException, AirflowException
+from airflow.exceptions import AirflowFailException, AirflowException, AirflowSkipException
 from livy import LivyBatch, SessionState
 
 from postgres_wrapper import postgres_query
@@ -21,10 +39,11 @@ from livy_wrapper import create_livy_batch, get_livy_batch_id_by_name, get_livy_
 log = logging.getLogger(__name__)
 
 pg_conn_id = "pg"
-base_cluster = "cluster1"
+base_cluster = "cluster1"                          # count 조회 기준 클러스터
 impala_refresh_variable = "refresh_flags"
 table_config_variable = "daily_merge_table_config"
 
+# 도메인별 HDFS base URL. 도메인 추가 시 여기에만 추가하면 된다.
 DOMAIN_PATH_MAP = {
     "path1": "hdfs://path1.com/impala",
     "path2": "hdfs://path2.com/impala",
@@ -33,21 +52,55 @@ DOMAIN_PATH_MAP = {
 
 @task(retries=3, retry_delay=timedelta(seconds=10))
 def load_refresh_flags_task():
+    """
+    Airflow Variable에서 클러스터별 refresh 실행 여부를 로드한다.
+
+    Returns:
+        dict: {cluster_name: flag} 형태. flag=True인 클러스터만 이후 태스크에서 사용된다.
+              flag 필터링은 impala_health_check_task에서 수행한다.
+
+    Variable 형식 예시:
+        [{"cluster": "cluster1", "flag": true}, {"cluster": "cluster2", "flag": false}]
+    """
     try:
         refresh_flags = Variable.get(impala_refresh_variable, deserialize_json=True)
     except Exception as e:
-        raise AirflowFailException(e)
+        raise AirflowFailException(f"Variable '{impala_refresh_variable}' 로드 실패: {e}")
 
     result = {item['cluster']: item['flag'] for item in refresh_flags}
 
     if not result:
         raise AirflowFailException(f"'{impala_refresh_variable}' Variable이 비어 있습니다.")
 
+    active = [c for c, f in result.items() if f]
+    inactive = [c for c, f in result.items() if not f]
+    log.info(f"refresh 대상 클러스터: {active}")
+    if inactive:
+        log.info(f"refresh 비활성 클러스터 (skip): {inactive}")
+
     return result
 
 
 @task
 def get_metadata_task(table_config, data_interval_end=None):
+    """
+    Postgres table_meta 테이블에서 병합 대상 테이블의 메타정보를 조회하고,
+    HDFS 경로와 target_date를 계산하여 반환한다.
+
+    Args:
+        table_config (dict): Airflow Variable의 테이블 설정 항목 1개.
+                             days_ago 기준으로 target_date를 계산한다.
+        data_interval_end: Airflow context에서 자동 주입되는 실행 기준 시각.
+
+    Returns:
+        dict: 이후 태스크에서 공통으로 사용하는 메타정보.
+              save_path, temp_path, backup_path, target_date, partition_cols 등 포함.
+
+    HDFS 경로 구조:
+        base:   {domain_path}{save_path}/{table_name}   (save_path는 '/'로 시작)
+        temp:   hdfs://temp_path.com/impala/merge/temp/{table_name}
+        backup: hdfs://temp_path.com/impala/merge/backup/{table_name}
+    """
     table_id = table_config['table_id']
 
     query = f"""select db, table_name, save_path, partitions, domain
@@ -73,6 +126,7 @@ def get_metadata_task(table_config, data_interval_end=None):
     temp_full_path = f"hdfs://temp_path.com/impala/merge/temp/{table_name}"
     backup_full_path = f"hdfs://temp_path.com/impala/merge/backup/{table_name}"
 
+    # data_interval_end 기준으로 KST 변환 후 days_ago만큼 빼서 target_date 계산
     run_date = data_interval_end.in_timezone('Asia/Seoul')
     days_ago = table_config['days_ago']
     target_date = run_date.subtract(days=days_ago).to_date_string()
@@ -81,7 +135,7 @@ def get_metadata_task(table_config, data_interval_end=None):
         'table_id': table_id,
         'db_name': db_name,
         'table_name': table_name,
-        'partition_cols': partition_cols,
+        'partition_cols': partition_cols,   # 최대 2개, 첫번째는 항상 날짜 컬럼
         'save_path': save_full_path,
         'temp_path': temp_full_path,
         'backup_path': backup_full_path,
@@ -90,14 +144,32 @@ def get_metadata_task(table_config, data_interval_end=None):
         'compression': table_config.get('compression', 'snappy')
     }
 
+    log.info(
+        f"metadata 조회 완료 | table: {db_name}.{table_name} | target_date: {target_date} | "
+        f"partition_cols: {partition_cols} | save_path: {save_full_path}"
+    )
+
     return metadata
 
 
 @task(retries=3, retry_delay=timedelta(seconds=10))
 def impala_health_check_task(metadata, refresh_flags):
+    """
+    refresh_flags에서 flag=True인 클러스터에 대해 Impala 연결 및 테이블 존재 여부를 확인한다.
+    하나의 클러스터라도 실패하면 전체 태스크를 실패 처리한다.
+
+    Args:
+        metadata (dict): get_metadata_task 반환값.
+        refresh_flags (dict): {cluster_name: flag} 형태.
+
+    Returns:
+        list: health check를 통과한 클러스터 이름 목록.
+              이후 swap_refresh_task에서 refresh 대상 클러스터로 사용된다.
+    """
     db_name = metadata['db_name']
     table_name = metadata['table_name']
 
+    # Impala에서는 테이블명 뒤에 '_t' suffix를 붙여 관리한다.
     query = f"show tables in {db_name} like '{table_name}_t'"
 
     passed_clusters = []
@@ -115,14 +187,22 @@ def impala_health_check_task(metadata, refresh_flags):
             passed_clusters.append(cluster)
 
     if failed_clusters:
-        log.error(f"health check failed clusters: {failed_clusters}")
+        log.error(f"health check 실패 클러스터: {failed_clusters}")
         raise AirflowFailException("health check failed")
 
+    log.info(f"health check 통과 클러스터: {passed_clusters}")
     return passed_clusters
 
 
 @task(retries=3, retry_delay=timedelta(seconds=10))
 def log_before_count_task(metadata):
+    """
+    병합 전 target_date 파티션의 row count를 조회하여 merge_log에 기록한다.
+    count가 0이면 데이터 미적재 상태로 판단하여 즉시 실패 처리한다.
+
+    merge_log upsert 시 before_count만 갱신하며 after_count는 건드리지 않는다.
+    retry/backfill 시 after_count가 초기화되는 것을 방지하기 위함이다.
+    """
     db_name = metadata['db_name']
     table_name = metadata['table_name']
     table_id = metadata['table_id']
@@ -138,7 +218,7 @@ def log_before_count_task(metadata):
     count = int(result_df.iloc[0, 0])
 
     if count == 0:
-        raise AirflowFailException(f"count가 0입니다. 데이터 적재 여부를 확인하세요: {db_name}.{table_name}_t / {target_date}")
+        raise AirflowSkipException(f"count가 0입니다. 병합 대상 데이터 없음으로 skip 처리: {db_name}.{table_name}_t / {target_date}")
 
     log.info(f"before merge count for {table_name} / {target_date}: {count}")
 
@@ -151,11 +231,22 @@ def log_before_count_task(metadata):
     try:
         postgres_query(pg_conn_id, insert_query, commit=True)
     except Exception as e:
-        raise AirflowFailException(e)
+        raise AirflowFailException(f"merge_log before_count 기록 실패 (table_id={table_id}, target_date={target_date}): {e}")
+
+    log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | target_date: {target_date} | before_count: {count}")
 
 
 @task(retries=3, retry_delay=timedelta(minutes=3))
 def livy_task(metadata):
+    """
+    Livy를 통해 Spark 소파일 병합 작업을 제출하고 완료까지 대기한다.
+
+    병합 결과는 temp 경로에 저장되며, 이후 swap_refresh_task에서 base 경로와 교체된다.
+    create_livy_batch 호출 직후 5초 대기는 Livy 서버의 배치 등록 지연에 대응하기 위함이다.
+
+    retry 시 동명 배치(Small-file-merge-daily-{table_name})가 Livy에 잔존할 수 있으므로
+    create_livy_batch wrapper의 중복 처리 방식을 확인해야 한다.
+    """
     table_name = metadata['table_name']
     sort_columns = metadata.get('sort_columns')
     batch_name = f"Small-file-merge-daily-{table_name}"
@@ -181,17 +272,20 @@ def livy_task(metadata):
     if not livy_status:
         raise AirflowFailException(f"Livy 배치 제출 실패 또는 RUNNING 상태 미달: {batch_name}")
 
+    # Livy 서버에 배치가 등록되기까지 약간의 지연이 있어 대기 후 조회
     time.sleep(5)
     try:
         (livy_batch_id, livy_state) = get_livy_batch_id_by_name(batch_name, "livy_cluster")
     except Exception as e:
         raise AirflowFailException(f"Livy API 오류로 batch ID 조회 실패: {batch_name}: {e}")
 
+    # get_livy_batch_id_by_name은 배치를 찾지 못하면 (-1, None)을 반환한다.
     if livy_batch_id == -1:
         raise AirflowFailException(f"Livy batch를 찾을 수 없습니다: {batch_name}")
 
     log.info(f"livy batch id: {livy_batch_id}, initial state: {livy_state}")
 
+    # get_livy_batch_by_id는 API 오류 시 None을 반환한다.
     livy_batch_obj = get_livy_batch_by_id(livy_batch_id, "livy_cluster")
     if livy_batch_obj is None:
         raise AirflowFailException(f"Livy batch 객체 조회 실패 (id={livy_batch_id})")
@@ -206,6 +300,14 @@ def livy_task(metadata):
 
 @task
 def get_partitions_task(metadata):
+    """
+    Spark 작업이 temp 경로에 생성한 manifest 파일을 읽어 파티션 목록을 반환한다.
+    manifest는 1줄 1 JSON 형식이며, 파티션 컬럼 순서가 보장된 상태로 저장된다.
+
+    Returns:
+        list[dict]: 파티션 정보 목록. 예: [{"dt": "2024-01-01", "hour": "00"}, ...]
+                    swap_refresh_task에서 Impala refresh 쿼리 생성에 사용된다.
+    """
     manifest_path = f"{metadata['temp_path']}/manifest/*.json"
 
     try:
@@ -228,11 +330,30 @@ def get_partitions_task(metadata):
     if not partition_list:
         raise AirflowFailException(f"manifest가 비어있습니다. Spark 작업 결과를 확인하세요: {manifest_path}")
 
+    log.info(f"manifest 파티션 {len(partition_list)}개 로드 완료: {partition_list}")
+
     return partition_list
 
 
 @task
 def swap_refresh_task(cluster_list, partition_list, metadata):
+    """
+    HDFS swap 후 Impala partition refresh 및 after_count 검증을 수행한다.
+
+    [HDFS Swap 순서]
+        1. base/{part1}={date} → backup/{part1}={date}  (기존 데이터 백업)
+        2. temp/{part1}={date} → base/{part1}={date}    (병합 결과 반영)
+        실패 시: backup/{part1}={date} → base/{part1}={date} 롤백
+
+    [retry 안전성]
+        retry 진입 시 temp 경로 존재 여부를 먼저 확인한다.
+        temp가 없으면 이미 swap이 완료된 것으로 판단하고 refresh 단계로 바로 진행한다.
+        롤백까지 실패한 경우에는 수동 복구가 필요하다.
+
+    [Impala Refresh]
+        health check를 통과한 클러스터들에 대해 ThreadPoolExecutor로 병렬 refresh.
+        모든 클러스터의 after_count가 일치해야 정상으로 판단한다.
+    """
     db_name = metadata['db_name']
     table_name = metadata['table_name']
     table_id = metadata['table_id']
@@ -245,9 +366,9 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
 
     temp_target_path = f"{temp_path}/{part1_column}={target_date}"
     base_target_path = f"{base_path}/{part1_column}={target_date}"
-
     backup_target_path = f"{backup_path}/{part1_column}={target_date}"
 
+    # retry 시 swap이 이미 완료된 경우 refresh 단계로 바로 진행
     temp_exists = subprocess.run(
         ["hdfs", "dfs", "-test", "-e", temp_target_path],
         capture_output=True
@@ -284,10 +405,13 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
         log.info(f"hdfs swap complete: {base_target_path} -> {backup_path}, {temp_target_path} -> {base_path}")
 
     def _refresh_partition(cluster):
+        """
+        단일 클러스터에 대해 파티션 refresh 후 after_count를 반환한다.
+        ThreadPoolExecutor에 의해 클러스터별로 병렬 호출된다.
+        """
         max_retries = 3
 
-        # refresh
-        # manifest에 파티션 순서(첫번째=날짜)가 보장된 상태로 저장됨
+        # manifest 파티션 순서(첫번째=날짜)가 보장된 상태로 저장되어 있어 순서대로 refresh
         for partition_dict in partition_list:
             spec_items = [f"{key}='{value}'" for key, value in partition_dict.items()]
             partition_spec = ",".join(spec_items)
@@ -303,6 +427,7 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
                         raise AirflowFailException(f"[{cluster}] partition refresh failed: {partition_spec}")
                     time.sleep(5)
 
+        # refresh 후 count 조회로 데이터 반영 확인
         for attempt in range(1, max_retries + 1):
             try:
                 count_query = f"select count(*) from {db_name}.{table_name}_t where {part1_column} = '{target_date}'"
@@ -315,14 +440,11 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
                     raise AirflowFailException(f"[{cluster}] count query failed after {max_retries} retries")
                 time.sleep(5)
 
-    # count
+    # 클러스터별 병렬 refresh 실행
     cluster_count_dict = {}
     failed_clusters = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(cluster_list)) as executor:
-        future_map = {}
-        for cluster in cluster_list:
-            future = executor.submit(_refresh_partition, cluster)
-            future_map[future] = cluster
+        future_map = {executor.submit(_refresh_partition, cluster): cluster for cluster in cluster_list}
         for future in concurrent.futures.as_completed(future_map):
             cluster = future_map[future]
             try:
@@ -337,7 +459,6 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
         raise AirflowFailException(f"다음 클러스터 refresh 실패: {failed_clusters}")
 
     log.info(f"cluster count results: {cluster_count_dict}")
-    log.info(f"cluster count results: {cluster_count_dict}")
 
     count_list = list(cluster_count_dict.values())
 
@@ -346,6 +467,8 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
 
     main_count = count_list[0]
 
+    # 클러스터 간 count 불일치는 refresh 누락 또는 복제 지연을 의미한다.
+    # AirflowException(retry 가능)으로 처리하여 일시적 지연 상황에 대응한다.
     if not all(count == main_count for count in count_list):
         raise AirflowException("클러스터간 count 불일치")
 
@@ -357,7 +480,9 @@ def swap_refresh_task(cluster_list, partition_list, metadata):
     try:
         postgres_query(pg_conn_id, update_query, commit=True)
     except Exception as e:
-        raise AirflowFailException(e)
+        raise AirflowFailException(f"merge_log after_count 업데이트 실패 (table_id={table_id}, target_date={target_date}): {e}")
+
+    log.info(f"merge_log after_count 업데이트 완료 | table_id: {table_id} | target_date: {target_date} | after_count: {main_count}")
 
 
 @task_group
@@ -369,6 +494,8 @@ def table_group(table_config, refresh_flags):
     partition_list = get_partitions_task(metadata)
     swap_refresh = swap_refresh_task(cluster_list, partition_list, metadata)
 
+    # impala_health_check_task 완료 후 count_before 실행 (cluster_list 의존)
+    # 이후 livy → get_partitions → swap_refresh 순서로 직렬 실행
     cluster_list >> log_before >> livy_job >> partition_list >> swap_refresh
 
 
@@ -376,13 +503,14 @@ def table_group(table_config, refresh_flags):
     dag_id='Small-File-Merge-Daily',
     schedule='@daily',
     default_args={'depends_on_past': False, 'weight_rule': 'upstream'},
-    max_active_runs=1,
+    max_active_runs=1,      # 동일 DAG 중복 실행 방지
     max_active_tasks=10
 )
 def daily_merge_dag():
     refresh_flags_dict = load_refresh_flags_task()
     table_config_list = Variable.get(table_config_variable, deserialize_json=True, default_var=[])
 
+    # Variable이 비어있으면 태스크 없이 DAG만 생성됨 (정상 동작)
     for table_config in table_config_list:
         table_id = table_config['table_id']
         table_group.override(group_id=f"table_{table_id}")(table_config, refresh_flags_dict)
