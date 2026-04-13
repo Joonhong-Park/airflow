@@ -35,9 +35,7 @@ import json
 import logging
 import concurrent.futures
 import time
-from datetime import timedelta
-
-import pendulum
+from datetime import date, timedelta
 
 _merge_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_merge_dir, '..', 'common'))
@@ -183,8 +181,12 @@ def get_metadata_task(table_config, data_interval_end=None):
 
     # start_date ~ end_date 사이의 날짜를 하루 단위로 열거
     # swap_refresh_task.expand(target_date=...) 에 전달되어 날짜별 병렬 태스크로 확장됨
-    period = pendulum.period(pendulum.parse(start_date), pendulum.parse(end_date))  # TODO(Airflow 3): pendulum.period → pendulum.interval (pendulum 3)
-    target_date_list = [dt.to_date_string() for dt in period.range('days')]
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    target_date_list = [
+        (start + timedelta(days=i)).isoformat()
+        for i in range((end - start).days + 1)
+    ]
 
     metadata = {
         'table_id': table_id,

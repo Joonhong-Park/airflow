@@ -72,7 +72,7 @@ load_refresh_flags_task
                                        (날짜별 동적 확장)
 ```
 
-모든 태스크는 `tasks/monthly_tasks.py`에서 관리. `merge_daily_dag`를 직접 import하지 않는다.
+`merge_daily_dag`를 직접 import하지 않는다.
 
 ## 태스크별 retry 설정
 
@@ -131,7 +131,6 @@ DOMAIN_PATH_MAP = {
 | 항목 | 현재 (Airflow 2) | 변경 후 (Airflow 3) |
 |---|---|---|
 | `data_interval_end.in_timezone()` | pendulum 2 메서드 | `in_tz()`로 변경 (pendulum 3) |
-| `pendulum.period` | `tasks/monthly_tasks.py` 사용 | `pendulum.interval`로 변경 (pendulum 3) |
 
 ## 주의사항
 
