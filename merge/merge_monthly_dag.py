@@ -35,7 +35,8 @@ import json
 import logging
 import concurrent.futures
 import time
-from datetime import date, timedelta
+from collections import defaultdict
+from datetime import timedelta
 
 _merge_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_merge_dir, '..', 'common'))
@@ -133,8 +134,7 @@ def get_metadata_task(table_config, data_interval_end=None):
 
     daily와의 차이점:
         - days_ago 대신 months_ago를 사용한다.
-        - target_date 단일값 대신 start_date, end_date, target_date_list를 반환한다.
-        - target_date_list는 swap_refresh_task를 날짜별로 동적 확장(.expand())하는 데 사용된다.
+        - target_date 단일값 대신 start_date, end_date를 반환한다.
 
     Args:
         table_config (dict): Airflow Variable의 테이블 설정 항목 1개.
@@ -142,7 +142,7 @@ def get_metadata_task(table_config, data_interval_end=None):
         data_interval_end: Airflow context에서 자동 주입되는 실행 기준 시각.
 
     Returns:
-        dict: start_date, end_date, target_date_list 등 월별 태스크 공통 메타정보.
+        dict: start_date, end_date 등 월별 태스크 공통 메타정보.
     """
     table_id = table_config['table_id']
 
@@ -179,15 +179,6 @@ def get_metadata_task(table_config, data_interval_end=None):
     start_date = target_month.start_of('month').to_date_string()   # 예: "2024-01-01"
     end_date = target_month.end_of('month').to_date_string()       # 예: "2024-01-31"
 
-    # start_date ~ end_date 사이의 날짜를 하루 단위로 열거
-    # swap_refresh_task.expand(target_date=...) 에 전달되어 날짜별 병렬 태스크로 확장됨
-    start = date.fromisoformat(start_date)
-    end = date.fromisoformat(end_date)
-    target_date_list = [
-        (start + timedelta(days=i)).isoformat()
-        for i in range((end - start).days + 1)
-    ]
-
     metadata = {
         'table_id': table_id,
         'db_name': db_name,
@@ -198,14 +189,13 @@ def get_metadata_task(table_config, data_interval_end=None):
         'backup_path': backup_full_path,
         'start_date': start_date,
         'end_date': end_date,
-        'target_date_list': target_date_list,
         'sort_columns': table_config.get('sort_columns'),
         'compression': table_config.get('compression', 'snappy'),
     }
 
     log.info(
         f"metadata 조회 완료 | table: {db_name}.{table_name} | "
-        f"대상 월: {start_date} ~ {end_date} ({len(target_date_list)}일) | "
+        f"대상 월: {start_date} ~ {end_date} | "
         f"partition_cols: {partition_cols} | save_path: {save_full_path}"
     )
 
@@ -418,13 +408,16 @@ def livy_task(metadata):
 @task
 def get_partitions_task(metadata):
     """
-    Spark 작업이 temp 경로에 생성한 manifest 파일을 읽어 파티션 목록을 반환한다.
+    Spark 작업이 temp 경로에 생성한 manifest 파일을 읽어 날짜별로 그룹화하여 반환한다.
     manifest는 1줄 1 JSON 형식이며, 파티션 컬럼 순서가 보장된 상태로 저장된다.
 
     Returns:
-        list[dict]: 파티션 정보 목록. 예: [{"dt": "2024-01-01", "hour": "00"}, ...]
-                    swap_refresh_task에서 Impala refresh 쿼리 생성에 사용된다.
+        list[dict]: 날짜별 그룹화된 파티션 목록.
+                    예: [{"target_date": "2025-01-01", "partitions": [{"dt": "2025-01-01", "hour": "00"}, ...]}, ...]
+                    swap_refresh_task.expand_kwargs()로 날짜 수만큼 동적 확장된다.
+                    각 task 인스턴스는 해당 날짜의 partitions만 수신한다.
     """
+    part1_column = metadata['partition_cols'][0]
     manifest_path = f"{metadata['temp_path']}/manifest/*.json"
 
     try:
@@ -447,21 +440,30 @@ def get_partitions_task(metadata):
     if not partition_list:
         raise AirflowFailException(f"manifest가 비어있습니다. Spark 작업 결과를 확인하세요: {manifest_path}")
 
-    log.info(f"manifest 파티션 {len(partition_list)}개 로드 완료: {partition_list}")
+    groups = defaultdict(list)
+    for p in partition_list:
+        groups[str(p[part1_column])].append(p)
 
-    return partition_list
+    date_groups = [
+        {"target_date": target_date, "partitions": partitions}
+        for target_date, partitions in groups.items()
+    ]
+
+    log.info(f"manifest 파티션 {len(partition_list)}개 → {len(date_groups)}개 날짜 그룹으로 로드 완료")
+
+    return date_groups
 
 
 @task(max_active_tis_per_dag=10)
-def swap_refresh_task(cluster_list, partition_list, metadata, target_date):
+def swap_refresh_task(cluster_list, metadata, target_date, partitions):
     """
     특정 날짜(target_date)의 HDFS swap 후 Impala partition refresh 및 after_count 검증을 수행한다.
 
     daily와의 차이점:
-        - target_date를 metadata에서 읽지 않고 명시적 파라미터로 수신한다.
-          → .expand(target_date=target_date_list)로 날짜별 동적 확장됨.
+        - target_date, partitions를 명시적 파라미터로 수신한다.
+          → get_partitions_task가 날짜별로 그룹화하여 반환한 date_groups로 expand_kwargs() 확장됨.
           → Airflow UI에서 [0], [1], ... 형태로 날짜 수만큼 개별 태스크 블록으로 표시됨.
-        - partition_list(월 전체 manifest)에서 target_date에 해당하는 파티션만 필터링하여 처리한다.
+        - partitions는 이미 해당 날짜 것만 포함되어 있어 별도 필터링이 불필요하다.
 
     [HDFS Swap 순서]
         1. base/{part1}={date} → backup/{part1}={date}  (기존 데이터 백업)
@@ -491,8 +493,7 @@ def swap_refresh_task(cluster_list, partition_list, metadata, target_date):
     temp_path = metadata['temp_path']
     backup_path = metadata['backup_path']
 
-    # monthly는 partition_list가 월 전체를 포함하므로 해당 날짜 파티션만 필터링
-    date_partition_list = [p for p in partition_list if str(p.get(part1_column)) == target_date]
+    date_partition_list = partitions
     if not date_partition_list:
         raise AirflowFailException(
             f"manifest에 target_date={target_date}에 해당하는 파티션이 없습니다. "
@@ -628,26 +629,24 @@ def table_group(table_config, refresh_flags):
     테이블 1개에 대한 월별 병합 전체 흐름을 묶은 task_group.
 
     테이블별로 table_group.override(group_id=...)로 호출된다.
-    swap_refresh_task는 target_date_list의 각 날짜에 대해 동적으로 확장(.expand())된다.
-    → Airflow 2.3+ 에서 XComArg subscript(metadata['target_date_list'])를 지원한다.
+    swap_refresh_task는 get_partitions_task의 날짜별 그룹 수만큼 동적으로 확장(.expand_kwargs())된다.
     """
     metadata = get_metadata_task(table_config)
     cluster_list = impala_health_check_task(metadata, refresh_flags)
     log_before = log_before_count_task.override(task_id="count_before")(metadata)
     livy_job = livy_task(metadata)
-    partition_list = get_partitions_task(metadata)
+    date_groups = get_partitions_task(metadata)
 
-    # swap_refresh_task는 target_date_list의 날짜 수만큼 동적으로 병렬 확장된다.
-    # metadata['target_date_list']는 XComArg subscript로 Airflow 2.3+ 필요.
+    # swap_refresh_task는 date_groups의 날짜 수만큼 동적으로 병렬 확장된다.
+    # date_groups: [{"target_date": "2025-01-01", "partitions": [...]}, ...]
     swap_refresh = swap_refresh_task.partial(
         cluster_list=cluster_list,
-        partition_list=partition_list,
         metadata=metadata,
-    ).expand(target_date=metadata['target_date_list'])
+    ).expand_kwargs(date_groups)
 
     # impala_health_check 완료 후 count_before 실행 (cluster_list 의존)
     # 이후 livy → get_partitions → swap_refresh 순서로 직렬 실행
-    cluster_list >> log_before >> livy_job >> partition_list >> swap_refresh
+    cluster_list >> log_before >> livy_job >> date_groups >> swap_refresh
 
 
 def create_monthly_dag(dag_id, config_variable, schedule):

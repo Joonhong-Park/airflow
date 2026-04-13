@@ -68,7 +68,7 @@ load_refresh_flags_task
             ├─ count_before (log_before_count_task)
             ├─ livy_task
             ├─ get_partitions_task
-            └─ swap_refresh_task.partial().expand(target_date=target_date_list)
+            └─ swap_refresh_task.partial().expand_kwargs(date_groups)
                                        (날짜별 동적 확장)
 ```
 
@@ -140,5 +140,5 @@ DOMAIN_PATH_MAP = {
 - `livy_task`에서 `create_livy_batch` 후 `time.sleep(5)` 후 ID 조회 — Livy 등록 지연 대응
 - `livy_task` retry 시 동명 배치가 Livy에 잔존할 수 있으므로 `create_livy_batch` wrapper의 중복 처리 방식 확인 필요
 - `task_group` 내부에 `expand()`가 있으므로 `task_group` 자체를 `expand_kwargs()`로 중첩 매핑하면 Airflow 2.x 미지원
-- `metadata['target_date_list']` XComArg subscript는 Airflow 2.3+ 지원
+- `get_partitions_task`가 날짜별 그룹화(`[{"target_date": ..., "partitions": [...]}]`)를 담당하며, `expand_kwargs()`로 날짜 수만큼 동적 확장
 - PostgreSQL 테이블: `table_meta`(메타정보), `merge_log`(before/after count 기록)
