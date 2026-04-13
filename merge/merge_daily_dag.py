@@ -239,7 +239,11 @@ def impala_health_check_task(metadata, refresh_flags):
 def log_before_count_task(metadata):
     """
     병합 전 target_date 파티션의 row count를 조회하여 merge_log에 기록한다.
-    count가 0이면 병합 대상 데이터가 없는 것으로 판단하여 이후 태스크를 skip 처리한다.
+
+    케이스 구분:
+        - result_df is None  → Impala 연결 오류. 재시도 필요 → AirflowFailException
+        - result_df is empty → count(*) 쿼리가 행을 반환하지 않은 비정상 상황 → AirflowFailException
+        - count == 0         → 데이터 없음. 병합 불필요 → AirflowSkipException (이후 태스크 전체 skip)
 
     merge_log upsert 시 before_count만 갱신하며 after_count는 건드리지 않는다.
     retry/backfill 시 after_count가 초기화되는 것을 방지하기 위함이다.
@@ -253,13 +257,25 @@ def log_before_count_task(metadata):
     count_query = f"select count(*) from {db_name}.{table_name}_t where {part1_column} = '{target_date}'"
     result_df = impala_query(count_query, base_cluster, True)
 
+    # None: Impala 연결 실패 또는 쿼리 실행 오류
     if result_df is None:
-        raise AirflowFailException(f"count 조회 실패: {db_name}.{table_name}_t / {target_date}")
+        raise AirflowFailException(
+            f"Impala 연결 오류로 count 조회 실패: {db_name}.{table_name}_t / {target_date}"
+        )
+
+    # empty: count(*) 는 항상 1행을 반환해야 하므로 비어있으면 비정상
+    if result_df.empty:
+        raise AirflowFailException(
+            f"count 쿼리 결과가 비어있습니다 (비정상): {db_name}.{table_name}_t / {target_date}"
+        )
 
     count = int(result_df.iloc[0, 0])
 
+    # count == 0: 해당 날짜에 데이터 없음 → 병합 대상 없으므로 이후 태스크 skip
     if count == 0:
-        raise AirflowSkipException(f"count가 0입니다. 병합 대상 데이터 없음으로 skip 처리: {db_name}.{table_name}_t / {target_date}")
+        raise AirflowSkipException(
+            f"count = 0. 병합 대상 데이터 없음으로 skip 처리: {db_name}.{table_name}_t / {target_date}"
+        )
 
     log.info(f"before merge count for {table_name} / {target_date}: {count}")
 

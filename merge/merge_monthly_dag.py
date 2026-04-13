@@ -259,19 +259,17 @@ def impala_health_check_task(metadata, refresh_flags):
 def log_before_count_task(metadata):
     """
     병합 전 대상 월 전체의 날짜별 row count를 GROUP BY로 한 번에 조회하여
-    각 날짜를 merge_log에 개별 insert(upsert)한다.
+    merge_log에 단일 bulk insert(upsert)한다.
 
     daily와의 차이점:
         - 날짜 단일 조회 대신 start_date ~ end_date 범위를 GROUP BY로 조회한다.
-        - 조회된 각 날짜별로 merge_log에 insert한다.
+        - 유효한 날짜 전체를 VALUES (...), (...) 형태로 단일 쿼리로 insert한다.
 
-    count=0인 날짜:
-        - 실제로 발생할 가능성은 낮지만, 0이면 merge_log insert를 skip하고 경고만 남긴다.
-        - 특정 날짜가 0이어도 다른 날짜 처리를 계속 진행하기 위해 태스크 전체를 중단하지 않는다.
-
-    결과가 전혀 없는 경우:
-        - result_df is None → Impala 연결 오류로 AirflowFailException
-        - result_df가 비어있음 → 대상 월 데이터 전체 없음으로 AirflowSkipException
+    케이스 구분:
+        - result_df is None  → Impala 연결 오류. 재시도 필요 → AirflowFailException
+        - result_df is empty → 대상 월 전체에 데이터 없음 → AirflowSkipException (이후 태스크 전체 skip)
+        - count == 0인 날짜  → 해당 날짜만 insert 제외하고 경고 로그. 다른 날짜는 계속 처리
+        - 유효 행 전체가 0   → 모든 날짜 count = 0. 병합 불필요 → AirflowSkipException
     """
     db_name = metadata['db_name']
     table_name = metadata['table_name']
@@ -289,44 +287,58 @@ def log_before_count_task(metadata):
     """
     result_df = impala_query(count_query, base_cluster, True)
 
+    # None: Impala 연결 실패 또는 쿼리 실행 오류
     if result_df is None:
         raise AirflowFailException(
-            f"count 조회 실패 (Impala 연결 오류): {db_name}.{table_name}_t / {start_date} ~ {end_date}"
+            f"Impala 연결 오류로 count 조회 실패: {db_name}.{table_name}_t / {start_date} ~ {end_date}"
         )
 
+    # empty: GROUP BY 결과가 없음 = 해당 월에 데이터 자체가 없음
     if result_df.empty:
         raise AirflowSkipException(
-            f"대상 월 데이터가 없습니다. 병합 대상 없음으로 skip 처리: "
+            f"대상 월 데이터 없음. 병합 대상 없으므로 skip 처리: "
             f"{db_name}.{table_name}_t / {start_date} ~ {end_date}"
         )
 
     log.info(f"before merge count 조회 완료 | {table_name} | {start_date} ~ {end_date} | 총 {len(result_df)}일")
 
+    # count == 0인 날짜는 insert 제외 (경고만 기록)
+    valid_rows = []
     for _, row in result_df.iterrows():
         date_val = str(row[0])
         count = int(row[1])
-
         if count == 0:
-            # 해당 날짜만 skip하고 다른 날짜 처리는 계속 진행
-            log.warning(f"count가 0입니다. merge_log insert skip: {table_name} / {date_val}")
-            continue
+            log.warning(f"count = 0. merge_log insert 제외: {table_name} / {date_val}")
+        else:
+            log.info(f"before merge count | {table_name} / {date_val}: {count}")
+            valid_rows.append((date_val, count))
 
-        log.info(f"before merge count | {table_name} / {date_val}: {count}")
+    # 유효한 날짜가 하나도 없으면 skip (전체 월 count = 0)
+    if not valid_rows:
+        raise AirflowSkipException(
+            f"모든 날짜의 count = 0. 병합 대상 없으므로 skip 처리: "
+            f"{db_name}.{table_name}_t / {start_date} ~ {end_date}"
+        )
 
-        insert_query = f"""
-            insert into merge_log (table_id, before_count, after_count, create_time, update_time, target_date)
-            values('{table_id}', {count}, 0, now(), now(), '{date_val}')
-            on conflict (table_id, target_date)
-            do update set before_count = excluded.before_count, update_time = now();
-        """
-        try:
-            postgres_query(pg_conn_id, insert_query, commit=True)
-        except Exception as e:
-            raise AirflowFailException(
-                f"merge_log before_count 기록 실패 (table_id={table_id}, target_date={date_val}): {e}"
-            )
+    # 유효한 날짜 전체를 단일 bulk insert
+    values_clause = ", ".join(
+        f"('{table_id}', {count}, 0, now(), now(), '{date_val}')"
+        for date_val, count in valid_rows
+    )
+    insert_query = f"""
+        insert into merge_log (table_id, before_count, after_count, create_time, update_time, target_date)
+        values {values_clause}
+        on conflict (table_id, target_date)
+        do update set before_count = excluded.before_count, update_time = now();
+    """
+    try:
+        postgres_query(pg_conn_id, insert_query, commit=True)
+    except Exception as e:
+        raise AirflowFailException(
+            f"merge_log before_count bulk insert 실패 (table_id={table_id}, {start_date} ~ {end_date}): {e}"
+        )
 
-    log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | {start_date} ~ {end_date}")
+    log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | {start_date} ~ {end_date} | {len(valid_rows)}일")
 
 
 @task(retries=3, retry_delay=timedelta(minutes=3), max_active_tis_per_dag=5)
