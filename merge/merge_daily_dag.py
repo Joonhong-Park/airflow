@@ -30,6 +30,7 @@ import json
 import logging
 import concurrent.futures
 import time
+import pendulum
 from datetime import timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'common'))
@@ -578,6 +579,7 @@ def create_daily_dag(dag_id, config_variable, schedule):
     @dag(
         dag_id=dag_id,
         schedule=schedule,
+        start_date=pendulum.datetime(2026, 4, 14, tz='Asia/Seoul'),
         default_args={
             'depends_on_past': False,
             'weight_rule': WeightRule.UPSTREAM,
