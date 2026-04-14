@@ -59,7 +59,7 @@ def dag_failure_alarm(context):
     """
     dag_id = context['dag'].dag_id
     task_id = context['task_instance'].task_id
-    execution_date = context['logical_date']
+    execution_date = context['logical_date']  # Airflow 2→3: execution_date → logical_date
     exception = context.get('exception')
     log_url = context['task_instance'].log_url
 

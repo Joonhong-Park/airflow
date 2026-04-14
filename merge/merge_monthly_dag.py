@@ -79,7 +79,7 @@ def dag_failure_alarm(context):
     """
     dag_id = context['dag'].dag_id
     task_id = context['task_instance'].task_id
-    execution_date = context['logical_date']
+    execution_date = context['logical_date']  # Airflow 2→3: execution_date → logical_date
     exception = context.get('exception')
     log_url = context['task_instance'].log_url
 
@@ -333,7 +333,7 @@ def log_before_count_task(metadata):
     log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | {start_date} ~ {end_date} | {len(valid_rows)}일")
 
 
-@task(retries=3, retry_delay=timedelta(minutes=3), max_active_tis_per_dagrun=5)
+@task(retries=3, retry_delay=timedelta(minutes=3), max_active_tis_per_dagrun=5)  # Airflow 2→3: max_active_tis_per_dag → max_active_tis_per_dagrun
 def livy_task(metadata):
     """
     Livy를 통해 Spark 소파일 병합 작업을 제출하고 완료까지 대기한다.
@@ -454,7 +454,7 @@ def get_partitions_task(metadata):
     return date_groups
 
 
-@task(max_active_tis_per_dagrun=10)
+@task(max_active_tis_per_dagrun=10)  # Airflow 2→3: max_active_tis_per_dag → max_active_tis_per_dagrun
 def swap_refresh_task(cluster_list, metadata, target_date, partitions):
     """
     특정 날짜(target_date)의 HDFS swap 후 Impala partition refresh 및 after_count 검증을 수행한다.
