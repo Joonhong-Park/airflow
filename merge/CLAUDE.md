@@ -183,7 +183,9 @@ DOMAIN_PATH_MAP = {
 | 항목 | 현재 (Airflow 2) | 변경 후 (Airflow 3) |
 |---|---|---|
 | `data_interval_end.in_timezone()` | pendulum 2 메서드 | `in_tz()`로 변경 (pendulum 3) |
-| `context['execution_date']` | dag_failure_alarm 내 | `context['logical_date']`로 변경 |
+| `from airflow.utils.weight_rule import WeightRule` | 두 DAG 파일 상단 | Airflow 3에서도 동일 경로 유지, 변경 불필요 |
+| `weight_rule` in `default_args` | - | Airflow 3에서도 동작 확인, 변경 불필요 |
+| `data_interval_end.in_timezone()` | 두 DAG 파일 `get_metadata_task` | `in_tz()`로 변경 (pendulum 3) |
 
 ## 주의사항
 

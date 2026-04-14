@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException, AirflowException, AirflowSkipException
-from airflow.utils.weight_rule import WeightRule
+from airflow.utils.weight_rule import WeightRule  # TODO(Airflow 3): airflow.utils.weight_rule 모듈 제거됨, 대체 경로 확인 필요
 from livy import SessionState
 
 from postgres_wrapper import postgres_query
@@ -59,7 +59,7 @@ def dag_failure_alarm(context):
     """
     dag_id = context['dag'].dag_id
     task_id = context['task_instance'].task_id
-    execution_date = context['execution_date']  # TODO(Airflow 3): logical_date로 변경
+    execution_date = context['logical_date']
     exception = context.get('exception')
     log_url = context['task_instance'].log_url
 
