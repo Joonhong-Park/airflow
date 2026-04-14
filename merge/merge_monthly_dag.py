@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(_merge_dir, '..', 'common'))
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException, AirflowException, AirflowSkipException
-from airflow.utils.weight_rule import WeightRule  # TODO(Airflow 3): airflow.utils.weight_rule 모듈 제거됨, 대체 경로 확인 필요
+from airflow.utils.weight_rule import WeightRule
 
 from postgres_wrapper import postgres_query
 from impyla_wrapper import impala_query
