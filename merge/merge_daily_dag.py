@@ -366,27 +366,6 @@ def livy_task(metadata):
         raise AirflowFailException(f"livy batch failed with state: {final_state}")
 
 
-def _find_new_directory(ls_output, cutoff):
-    """
-    'hdfs dfs -ls -R' 출력에서 cutoff 이후 mtime을 가진 디렉토리 항목을 찾는다.
-    디렉토리 항목만 확인한다 — 새 파일이 추가되면 그 파일의 부모 디렉토리 mtime이
-    갱신되므로, 파일 항목까지 개별 확인할 필요가 없다.
-
-    Returns:
-        (path, mtime) 튜플. 새 디렉토리가 없으면 None.
-    """
-    for line in ls_output.splitlines():
-        if not line.startswith("d"):
-            continue
-        parts = line.split()
-        if len(parts) < 8:
-            continue
-        mtime = datetime.strptime(f"{parts[5]} {parts[6]}", "%Y-%m-%d %H:%M")
-        if mtime > cutoff:
-            return parts[-1], mtime
-    return None
-
-
 @task
 def check_new_file_task(metadata, cutoff_time):
     """
@@ -406,7 +385,21 @@ def check_new_file_task(metadata, cutoff_time):
     if result.returncode != 0:
         raise AirflowFailException(f"source 경로 조회 실패: {result.stderr}")
 
-    detected = _find_new_directory(result.stdout, cutoff)
+    # 'hdfs dfs -ls -R' 출력에서 cutoff 이후 mtime을 가진 디렉토리 항목을 찾는다.
+    # 디렉토리 항목만 확인한다 — 새 파일이 추가되면 그 파일의 부모 디렉토리 mtime이
+    # 갱신되므로, 파일 항목까지 개별 확인할 필요가 없다.
+    detected = None
+    for line in result.stdout.splitlines():
+        if not line.startswith("d"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        mtime = datetime.strptime(f"{parts[5]} {parts[6]}", "%Y-%m-%d %H:%M")
+        if mtime > cutoff:
+            detected = (parts[-1], mtime)
+            break
+
     if detected:
         path, mtime = detected
         raise AirflowFailException(
