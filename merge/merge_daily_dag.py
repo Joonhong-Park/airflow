@@ -19,6 +19,7 @@ HDFS swap을 통해 base 경로와 교체하고 Impala partition refresh를 수�
             ├─ impala_health_check_task
             ├─ count_before (log_before_count_task)
             ├─ livy_task
+            ├─ check_new_file_task     (livy_task 실행 중 base 경로에 새 파일 유입 감지 시 fail)
             ├─ get_partitions_task
             └─ swap_refresh_task
 """
@@ -31,7 +32,7 @@ import logging
 import concurrent.futures
 import time
 import pendulum
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'common'))
 
@@ -248,7 +249,12 @@ def log_before_count_task(metadata):
 
     merge_log upsert 시 before_count만 갱신하며 after_count는 건드리지 않는다.
     retry/backfill 시 after_count가 초기화되는 것을 방지하기 위함이다.
+
+    함수 시작 시점의 timestamp를 cutoff_time으로 반환한다. livy_task 실행 도중
+    base 경로에 새 파일이 유입되는지 판단하는 기준선으로 check_new_file_task에서 사용된다.
     """
+    cutoff_time = datetime.now().isoformat()
+
     db_name = metadata['db_name']
     table_name = metadata['table_name']
     table_id = metadata['table_id']
@@ -292,6 +298,8 @@ def log_before_count_task(metadata):
         raise AirflowFailException(f"merge_log before_count 기록 실패 (table_id={table_id}, target_date={target_date}): {e}")
 
     log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | target_date: {target_date} | before_count: {count}")
+
+    return cutoff_time
 
 
 @task(retries=3, retry_delay=timedelta(minutes=3))
@@ -356,6 +364,57 @@ def livy_task(metadata):
 
     if final_state != SessionState.SUCCESS:
         raise AirflowFailException(f"livy batch failed with state: {final_state}")
+
+
+def _find_new_directory(ls_output, cutoff):
+    """
+    'hdfs dfs -ls -R' 출력에서 cutoff 이후 mtime을 가진 디렉토리 항목을 찾는다.
+    디렉토리 항목만 확인한다 — 새 파일이 추가되면 그 파일의 부모 디렉토리 mtime이
+    갱신되므로, 파일 항목까지 개별 확인할 필요가 없다.
+
+    Returns:
+        (path, mtime) 튜플. 새 디렉토리가 없으면 None.
+    """
+    for line in ls_output.splitlines():
+        if not line.startswith("d"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        mtime = datetime.strptime(f"{parts[5]} {parts[6]}", "%Y-%m-%d %H:%M")
+        if mtime > cutoff:
+            return parts[-1], mtime
+    return None
+
+
+@task
+def check_new_file_task(metadata, cutoff_time):
+    """
+    livy_task 실행 도중 base 경로에 새 파일이 적재됐는지 확인한다.
+
+    감지되면 AirflowFailException으로 fail 처리한다. retry는 설정하지 않는다 —
+    재시도해도 동일한 HDFS 상태를 다시 보는 것뿐이라 의미가 없다. 복구는 운영자가
+    Airflow UI에서 count_before 태스크부터 clear하여 수동으로 재실행한다.
+    """
+    base_target_path = f"{metadata['save_path']}/{metadata['partition_cols'][0]}={metadata['target_date']}"
+    cutoff = datetime.fromisoformat(cutoff_time) - timedelta(minutes=1)
+
+    result = subprocess.run(
+        ["hdfs", "dfs", "-ls", "-R", base_target_path],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise AirflowFailException(f"source 경로 조회 실패: {result.stderr}")
+
+    detected = _find_new_directory(result.stdout, cutoff)
+    if detected:
+        path, mtime = detected
+        raise AirflowFailException(
+            f"livy_task 실행 중 새 파일 유입 감지: {path} (mtime={mtime}). "
+            f"count_before부터 재시작 필요."
+        )
+
+    log.info(f"신규 파일 유입 없음 확인: {base_target_path}")
 
 
 @task
@@ -549,12 +608,14 @@ def table_group(table_config, refresh_flags):
     cluster_list = impala_health_check_task(metadata, refresh_flags)
     log_before = log_before_count_task.override(task_id="count_before")(metadata)
     livy_job = livy_task(metadata)
+    source_check = check_new_file_task(metadata, log_before)
     partition_list = get_partitions_task(metadata)
     swap_refresh = swap_refresh_task(cluster_list, partition_list, metadata)
 
     # impala_health_check_task 완료 후 count_before 실행 (cluster_list 의존)
-    # 이후 livy → get_partitions → swap_refresh 순서로 직렬 실행
-    cluster_list >> log_before >> livy_job >> partition_list >> swap_refresh
+    # 이후 livy → check_new_file → get_partitions → swap_refresh 순서로 직렬 실행
+    # log_before가 반환하는 cutoff_time을 check_new_file_task가 소비한다
+    cluster_list >> log_before >> livy_job >> source_check >> partition_list >> swap_refresh
 
 
 def create_daily_dag(dag_id, config_variable, schedule):
@@ -586,7 +647,7 @@ def create_daily_dag(dag_id, config_variable, schedule):
             'on_failure_callback': dag_failure_alarm,
         },
         max_active_runs=1,      # 동일 DAG 중복 실행 방지
-        max_active_tasks=10
+        max_active_tasks=5      # 동시 처리 테이블 수 제한 (23개 중 최대 5개)
     )
     def daily_merge_dag():
         refresh_flags_dict = load_refresh_flags_task()

@@ -29,8 +29,14 @@ default_args={
     'on_failure_callback': dag_failure_alarm,   # 태스크 실패 시 알람 전송
 }
 max_active_runs=1       # 동일 DAG 중복 실행 방지
-max_active_tasks=10
 ```
+
+| DAG 종류 | max_active_tasks | 비고 |
+|---|---|---|
+| daily | 5 | 23개 테이블 중 동시 최대 5개 처리 |
+| monthly | 5 | daily와 동일하게 동시 최대 5개 처리 |
+
+`table_group` 내부 태스크는 직렬 실행이므로, `max_active_tasks`가 곧 동시 처리 테이블 수 상한이 된다. pool은 사용하지 않는다.
 
 ## Airflow Variables
 
@@ -76,14 +82,19 @@ load_refresh_flags_task
             ├─ impala_health_check_task
             ├─ count_before (log_before_count_task)
             ├─ livy_task
+            ├─ check_new_file_task
             ├─ get_partitions_task
             └─ swap_refresh_task(cluster_list, partition_list, metadata)
 ```
 
-태스크 의존 순서: `get_metadata_task → impala_health_check_task → count_before → livy_task → get_partitions_task → swap_refresh_task`
+태스크 의존 순서: `get_metadata_task → impala_health_check_task → count_before → livy_task → check_new_file_task → get_partitions_task → swap_refresh_task`
 
 - `get_partitions_task`는 단순 파티션 목록 반환 (`[{"dt": "2024-01-01", "hour": "00"}, ...]`)
 - `swap_refresh_task`는 단일 인스턴스 실행 (expand 없음)
+- `check_new_file_task`는 livy_task 실행 도중 base 경로에 새 파일이 유입됐는지 확인한다.
+  `count_before`가 반환한 cutoff_time 이후 mtime을 가진 디렉토리가 있으면 `AirflowFailException`으로
+  fail 처리(retry 없음) — swap 시 신규 데이터가 backup으로 밀려나 유실되는 것을 막기 위함이다.
+  복구는 운영자가 `count_before`부터 수동으로 clear하여 재실행한다. monthly DAG에는 아직 적용되지 않았다.
 
 ## DAG 흐름 (월별)
 
@@ -115,6 +126,7 @@ load_refresh_flags_task
 | `impala_health_check_task` | 3 | 10s | |
 | `log_before_count_task` | 3 | 10s | |
 | `livy_task` | 3 | 3min | Spark 작업 제출/대기 |
+| `check_new_file_task` | 없음 | - | 같은 HDFS 상태를 재검사할 뿐이라 retry 무의미 (일별 DAG 전용) |
 | `swap_refresh_task` | 없음 | - | retry 안전성은 temp 경로 체크로 보장 |
 
 ## 월별 DAG 동시 실행 제한

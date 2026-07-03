@@ -679,7 +679,7 @@ def create_monthly_dag(dag_id, config_variable, schedule):
             'on_failure_callback': dag_failure_alarm,
         },
         max_active_runs=1,      # 동일 DAG 중복 실행 방지
-        max_active_tasks=10,
+        max_active_tasks=5,     # 동시 처리 테이블 수 제한 (daily와 동일)
     )
     def monthly_merge_dag():
         refresh_flags_dict = load_refresh_flags_task()
