@@ -368,7 +368,7 @@ def log_before_count_task(metadata):
     log.info(f"merge_log before_count 기록 완료 | table_id: {table_id} | {start_date} ~ {end_date} | {len(valid_rows)}일")
 
 
-@task(retries=3, retry_delay=timedelta(minutes=3), max_active_tis_per_dagrun=5)  # Airflow 2→3: max_active_tis_per_dag → max_active_tis_per_dagrun
+@task(retries=3, retry_delay=timedelta(minutes=3))
 def livy_task(metadata):
     """
     Livy를 통해 Spark 소파일 병합 작업을 제출하고 완료까지 대기한다.
@@ -381,10 +381,8 @@ def livy_task(metadata):
     병합 결과는 temp 경로에 날짜별 파티션으로 저장되며,
     이후 swap_refresh_task가 날짜별로 병렬 실행되어 base 경로와 교체한다.
 
-    max_active_tis_per_dag=5:
-        한 DAG run 내에서 livy_task 인스턴스를 최대 5개까지만 동시에 실행한다.
-        Livy는 테이블당 가장 오래 실행되는 태스크이므로, 이 설정이 사실상 동시 처리 테이블 수를 제어한다.
-        (Airflow 2.2+ 지원)
+    동시 처리 테이블 수는 태스크 단위 설정이 아닌 DAG 단위 max_active_tasks=10으로 제어한다
+    (max_active_tis_per_dagrun이 기대대로 동작하지 않는 것으로 확인되어 제거함).
     """
     table_name = metadata['table_name']
     sort_columns = metadata.get('sort_columns')
@@ -489,7 +487,7 @@ def get_partitions_task(metadata):
     return date_groups
 
 
-@task(max_active_tis_per_dagrun=10)  # Airflow 2→3: max_active_tis_per_dag → max_active_tis_per_dagrun
+@task
 def swap_refresh_task(cluster_list, metadata, target_date, partitions):
     """
     특정 날짜(target_date)의 HDFS swap 후 Impala partition refresh 및 after_count 검증을 수행한다.
@@ -514,10 +512,8 @@ def swap_refresh_task(cluster_list, metadata, target_date, partitions):
         health check를 통과한 클러스터들에 대해 ThreadPoolExecutor로 병렬 refresh.
         모든 클러스터의 after_count가 일치해야 정상으로 판단한다.
 
-    max_active_tis_per_dag=10:
-        한 DAG run 내에서 swap_refresh_task 인스턴스를 최대 10개까지만 동시에 실행한다.
-        .expand()로 날짜별 동적 확장되므로 테이블 수 × 월 일수만큼 인스턴스가 생성될 수 있어
-        반드시 동시 실행 수를 제한해야 한다. (Airflow 2.2+ 지원)
+    동시 실행 인스턴스 수는 태스크 단위 설정이 아닌 DAG 단위 max_active_tasks=10으로 제어한다
+    (max_active_tis_per_dagrun이 기대대로 동작하지 않는 것으로 확인되어 제거함).
     """
     db_name = metadata['db_name']
     table_name = metadata['table_name']
