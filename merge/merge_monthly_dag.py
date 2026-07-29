@@ -1,27 +1,36 @@
 """
 Small File Merge Monthly DAG
 
-매월 지정된 날짜에 실행되어 특정 달의 전체 파티션을 한 번에 병합한다.
+매월 지정된 달의 전체 파티션을 한 번에 병합한다.
 병합은 Livy(Spark)로 월 전체를 처리하고, swap/refresh는 날짜별로 병렬 실행한다.
 
-테이블 목록이 많은 경우를 대비해 실행일을 나눈 DAG로 분리한다.
-    Day1: 매월 1일 새벽 1시 실행 (일별 DAG 2시·3시 등과 시간차 확보)
-    Day2: 매월 2일 새벽 1시 실행
-    ...
+운영용/소급용 두 종류의 DAG로 나뉜다.
+    운영용 (Small-File-Merge-Monthly): 매일 새벽 1시 실행되는 단일 DAG.
+        테이블 설정의 execute_date(매월 실행일, 1~31)가 오늘과 일치하는 테이블만 병합하고
+        나머지는 check_execute_date_task에서 skip 처리한다.
+    소급용 (Small-File-Merge-Monthly-Backfill-DayN): 수동 트리거 전용(schedule=None).
+        테이블이 많아 관리 편의를 위해 Day1/Day2...로 Variable을 나눠 등록한다.
+        운영용과 동일하게 execute_date 비교 로직을 거치므로, 특정 날짜에 강제로 실행하려면
+        Airflow UI의 'Trigger DAG w/ config'로 logical date를 원하는 날짜로 지정한다.
 
-새 DAG 추가 시 파일 하단의 create_monthly_dag() 호출을 한 줄 추가하면 된다.
+새 DAG 추가 시 파일 하단의 create_monthly_dag() / create_monthly_backfill_dag() 호출을
+한 줄 추가하면 된다.
 daily DAG와 코드 내용은 동일하더라도 merge_daily_dag.py를 직접 import하지 않는다.
 daily/monthly DAG는 완전히 독립 실행된다.
 
 흐름 (테이블별 table_group):
     load_refresh_flags_task
         └─ [테이블별 table_group]
+            ├─ check_execute_date_task
             ├─ get_metadata_task
             ├─ impala_health_check_task
             ├─ count_before (log_before_count_task)
-            ├─ livy_task               (max_active_tis_per_dag=5)
+            ├─ livy_task
             ├─ get_partitions_task
-            └─ swap_refresh_task[0..N-1] (날짜별 동적 확장, max_active_tis_per_dag=10)
+            └─ swap_refresh_task[0..N-1] (날짜별 동적 확장)
+
+동시 실행 수 제어는 태스크 단위(max_active_tis_per_dagrun)가 아닌 DAG 단위
+max_active_tasks=10으로 일원화한다 (기존 태스크 단위 설정이 기대대로 동작하지 않는 것으로 확인됨).
 
 Airflow UI:
     swap_refresh_task는 .expand()로 확장되므로 UI에서 [0], [1], ... 블록으로 표시된다.
@@ -752,9 +761,14 @@ def create_monthly_backfill_dag(dag_id, config_variable):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DAG 목록
-# 테이블이 많아 실행일을 분산할 경우 아래에 한 줄씩 추가한다.
-# 동일 테이블이 여러 dayN Variable에 중복 등록되지 않도록 운영 관리 필요.
+# 운영용: 매일 실행되는 단일 DAG. 테이블별 execute_date로 실행일이 결정되므로
+#        DAG/Variable을 추가로 나눌 필요가 없다.
+# 소급용: 수동 트리거 전용. 테이블이 많아 관리 편의를 위해 Day1/Day2...로 Variable을
+#        나눠 등록한다. 동일 테이블이 여러 backfill Variable에 중복 등록되지 않도록
+#        운영 관리 필요.
 # ─────────────────────────────────────────────────────────────────────────────
-create_monthly_dag('Small-File-Merge-Monthly-Day1', 'monthly_merge_table_config_day1', '0 1 1 * *')
-create_monthly_dag('Small-File-Merge-Monthly-Day2', 'monthly_merge_table_config_day2', '0 1 2 * *')
-# create_monthly_dag('Small-File-Merge-Monthly-Day3', 'monthly_merge_table_config_day3', '0 1 3 * *')
+create_monthly_dag('Small-File-Merge-Monthly', 'monthly_merge_table_config', '0 1 * * *')
+
+create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day1', 'monthly_merge_table_config_backfill_day1')
+create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day2', 'monthly_merge_table_config_backfill_day2')
+# create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day3', 'monthly_merge_table_config_backfill_day3')
