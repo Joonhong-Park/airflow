@@ -128,6 +128,40 @@ def load_refresh_flags_task():
 
 
 @task
+def check_execute_date_task(table_config, data_interval_end=None):
+    """
+    table_config의 execute_date(매월 실행일, 1~31)와 DAG 실행일의 '일'을 비교하여
+    불일치하면 skip 처리한다. get_metadata_task보다 먼저 실행되어, skip 대상 테이블은
+    Postgres/Impala 조회 없이 즉시 걸러진다.
+
+    운영용/소급용 DAG 모두 동일한 로직을 사용한다 (수동 트리거인 소급용도 data_interval_end
+    기준으로 비교하며, 특정 날짜에 강제 실행하려면 트리거 시 logical date를 지정한다).
+
+    Args:
+        table_config (dict): Airflow Variable의 테이블 설정 항목 1개. execute_date 포함.
+        data_interval_end: Airflow context에서 자동 주입되는 실행 기준 시각.
+
+    Raises:
+        AirflowFailException: table_config에 execute_date 키가 없는 경우.
+        AirflowSkipException: 오늘(KST)이 execute_date와 다른 경우 (이후 태스크 전체 skip).
+    """
+    table_id = table_config['table_id']
+    execute_date = table_config.get('execute_date')
+
+    if execute_date is None:
+        raise AirflowFailException(f"table_config에 'execute_date' 키가 없습니다. (table_id={table_id})")
+
+    run_day = data_interval_end.in_timezone('Asia/Seoul').day  # TODO(Airflow 3): in_timezone() → in_tz() (pendulum 3)
+
+    if run_day != execute_date:
+        raise AirflowSkipException(
+            f"execute_date 불일치로 skip: table_id={table_id}, execute_date={execute_date}, 오늘={run_day}"
+        )
+
+    log.info(f"execute_date 일치, 병합 진행: table_id={table_id}, execute_date={execute_date}")
+
+
+@task
 def get_metadata_task(table_config, data_interval_end=None):
     """
     Postgres table_meta에서 메타정보를 조회하고, months_ago 기반으로 병합 대상 월의
@@ -631,8 +665,12 @@ def table_group(table_config, refresh_flags):
 
     테이블별로 table_group.override(group_id=...)로 호출된다.
     swap_refresh_task는 get_partitions_task의 날짜별 그룹 수만큼 동적으로 확장(.expand_kwargs())된다.
+    check_execute_date_task가 skip되면 이후 태스크 전체가 Airflow의 skip 전파 규칙에 따라 skip된다.
     """
+    execute_date_check = check_execute_date_task(table_config)
     metadata = get_metadata_task(table_config)
+    execute_date_check >> metadata
+
     cluster_list = impala_health_check_task(metadata, refresh_flags)
     log_before = log_before_count_task.override(task_id="count_before")(metadata)
     livy_job = livy_task(metadata)
