@@ -686,22 +686,26 @@ def table_group(table_config, refresh_flags):
 
 def create_monthly_dag(dag_id, config_variable, schedule):
     """
-    월별 병합 DAG를 생성하는 팩토리 함수.
+    월별 병합 DAG를 생성하는 팩토리 함수. 운영용/소급용 DAG 모두 이 팩토리를 사용한다
+    (소급용은 create_monthly_backfill_dag가 schedule=None으로 감싸서 호출한다).
 
     Args:
-        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Monthly-Day1'
+        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Monthly'
         config_variable (str): 테이블 설정을 담은 Airflow Variable 이름.
-                               예: 'monthly_merge_table_config_day1'
-        schedule (str): cron 표현식. 예: '0 1 1 * *' (매월 1일 01:00)
+                               예: 'monthly_merge_table_config'
+        schedule (str or None): cron 표현식. 예: '0 1 * * *' (매일 01:00).
+                                None이면 수동 트리거 전용 DAG가 된다 (소급용).
 
     Returns:
         DAG 인스턴스 (Airflow가 전역 스코프에서 자동 인식)
 
     Variable 형식 예시:
         [
-            {"table_id": 1, "months_ago": 1, "sort_columns": "col1,col2", "compression": "snappy"},
-            {"table_id": 2, "months_ago": 1, "compression": "zstd"}
+            {"table_id": 1, "execute_date": 5, "months_ago": 1, "sort_columns": "col1,col2", "compression": "snappy"},
+            {"table_id": 2, "execute_date": 12, "months_ago": 1, "compression": "zstd"}
         ]
+        execute_date(1~31)가 DAG 실행일의 '일'과 일치하는 테이블만 병합되고, 나머지는
+        check_execute_date_task에서 skip 처리된다.
     """
     @dag(
         dag_id=dag_id,
@@ -713,7 +717,7 @@ def create_monthly_dag(dag_id, config_variable, schedule):
             'on_failure_callback': dag_failure_alarm,
         },
         max_active_runs=1,      # 동일 DAG 중복 실행 방지
-        max_active_tasks=5,     # 동시 처리 테이블 수 제한 (daily와 동일)
+        max_active_tasks=10,    # 동시 처리 테이블 수 제한
     )
     def monthly_merge_dag():
         refresh_flags_dict = load_refresh_flags_task()
@@ -725,6 +729,25 @@ def create_monthly_dag(dag_id, config_variable, schedule):
             table_group.override(group_id=f"table_{table_id}")(table_config, refresh_flags_dict)
 
     return monthly_merge_dag()
+
+
+def create_monthly_backfill_dag(dag_id, config_variable):
+    """
+    소급용(수동 트리거 전용) 월별 병합 DAG를 생성하는 팩토리 함수.
+
+    create_monthly_dag를 schedule=None으로 감싼 얇은 래퍼. 운영용과 동일한 태스크 흐름과
+    execute_date 비교 로직을 그대로 사용하며, 자동 스케줄 없이 운영자가 필요할 때 수동으로
+    트리거한다는 점만 다르다.
+
+    Args:
+        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Monthly-Backfill-Day1'
+        config_variable (str): 테이블 설정을 담은 Airflow Variable 이름.
+                               예: 'monthly_merge_table_config_backfill_day1'
+
+    Returns:
+        DAG 인스턴스 (Airflow가 전역 스코프에서 자동 인식)
+    """
+    return create_monthly_dag(dag_id, config_variable, schedule=None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
