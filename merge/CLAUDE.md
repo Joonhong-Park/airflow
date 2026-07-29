@@ -7,7 +7,7 @@
 | 파일 | 역할 |
 |---|---|
 | `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily-2am`, `3am`, ...) |
-| `merge_monthly_dag.py` | 월별 병합 DAG (`Small-File-Merge-Monthly-Day1`, `Day2`, ...) |
+| `merge_monthly_dag.py` | 월별 병합 DAG (운영용 `Small-File-Merge-Monthly`, 소급용 `Backfill-Day1`, `Day2`, ...) |
 
 ## 등록된 DAG 목록
 
@@ -15,10 +15,11 @@
 |---|---|---|
 | `Small-File-Merge-Daily-2am` | `0 2 * * *` | `daily_table_2am_config` |
 | `Small-File-Merge-Daily-3am` | `0 3 * * *` | `daily_table_3am_config` |
-| `Small-File-Merge-Monthly-Day1` | `0 1 1 * *` | `monthly_merge_table_config_day1` |
-| `Small-File-Merge-Monthly-Day2` | `0 1 2 * *` | `monthly_merge_table_config_day2` |
+| `Small-File-Merge-Monthly` (운영용) | `0 1 * * *` | `monthly_merge_table_config` |
+| `Small-File-Merge-Monthly-Backfill-Day1` (소급용, 수동 트리거) | 없음 (`schedule=None`) | `monthly_merge_table_config_backfill_day1` |
+| `Small-File-Merge-Monthly-Backfill-Day2` (소급용, 수동 트리거) | 없음 (`schedule=None`) | `monthly_merge_table_config_backfill_day2` |
 
-새 DAG 추가 시 각 파일 하단의 `create_daily_dag()` / `create_monthly_dag()` 한 줄 추가.
+새 DAG 추가 시 각 파일 하단의 `create_daily_dag()` / `create_monthly_dag()` / `create_monthly_backfill_dag()` 한 줄 추가.
 
 ## DAG 공통 설정
 
@@ -34,7 +35,7 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
 | DAG 종류 | max_active_tasks | 비고 |
 |---|---|---|
 | daily | 5 | 23개 테이블 중 동시 최대 5개 처리 |
-| monthly | 5 | daily와 동일하게 동시 최대 5개 처리 |
+| monthly | 10 | 운영용/소급용 공통. 테이블 약 70개 중 동시 최대 10개 처리 |
 
 `table_group` 내부 태스크는 직렬 실행이므로, `max_active_tasks`가 곧 동시 처리 테이블 수 상한이 된다. pool은 사용하지 않는다.
 
@@ -44,7 +45,8 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
 |---|---|---|
 | `refresh_flags` | JSON array | 클러스터별 refresh 실행 여부 (`[{"cluster": "...", "flag": true}]`) |
 | `daily_table_{H}am_config` | JSON array | 일별 병합 테이블 설정 (H시 실행, 예: 2am, 3am) |
-| `monthly_merge_table_config_day{N}` | JSON array | 월별 병합 테이블 설정 (N일 실행, N=1,2,3,...) |
+| `monthly_merge_table_config` | JSON array | 운영용 월별 병합 테이블 설정 (매일 실행, execute_date로 대상 필터링) |
+| `monthly_merge_table_config_backfill_day{N}` | JSON array | 소급용 월별 병합 테이블 설정 (수동 트리거 전용, N=1,2,3,...) |
 
 ## 테이블 설정 스키마
 
@@ -59,10 +61,11 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
   }
 ]
 
-// monthly_merge_table_config_day1 / day2 / ...
+// monthly_merge_table_config (운영용) / monthly_merge_table_config_backfill_day1 / day2 / ... (소급용)
 [
   {
     "table_id": 1,
+    "execute_date": 5,
     "months_ago": 1,
     "sort_columns": "col1,col2",
     "compression": "snappy"
@@ -71,6 +74,8 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
 ```
 
 `sort_columns`는 선택 항목. `compression` 기본값은 `snappy`.
+`execute_date`(1~31, monthly 전용, 필수)는 매월 실행일이며, DAG 실행일의 '일'과 다르면 해당
+테이블은 `check_execute_date_task`에서 skip 처리된다. 운영용/소급용 모두 동일하게 적용된다.
 
 ## DAG 흐름 (일별)
 
@@ -102,17 +107,21 @@ load_refresh_flags_task
 load_refresh_flags_task
     └─ for each table_config:
         table_group (group_id=table_{table_id})
+            ├─ check_execute_date_task
             ├─ get_metadata_task
             ├─ impala_health_check_task
             ├─ count_before (log_before_count_task)
-            ├─ livy_task                          (max_active_tis_per_dag=5)
+            ├─ livy_task
             ├─ get_partitions_task
             └─ swap_refresh_task.partial(cluster_list, metadata)
-                   .expand_kwargs(date_groups)    (날짜별 동적 확장, max_active_tis_per_dag=10)
+                   .expand_kwargs(date_groups)    (날짜별 동적 확장)
 ```
 
-태스크 의존 순서: `get_metadata_task → impala_health_check_task → count_before → livy_task → get_partitions_task → swap_refresh_task[0..N-1]`
+태스크 의존 순서: `check_execute_date_task → get_metadata_task → impala_health_check_task → count_before → livy_task → get_partitions_task → swap_refresh_task[0..N-1]`
 
+- `check_execute_date_task`는 table_config의 `execute_date`(1~31)와 DAG 실행일의 '일'을 비교한다.
+  불일치 시 `AirflowSkipException`으로 skip (retry 없음, 순수 로직 비교라 재시도 무의미) —
+  이후 태스크 전체가 Airflow의 skip 전파 규칙에 따라 skip된다. 운영용/소급용 DAG 모두 동일하게 적용.
 - `get_partitions_task`는 날짜별 그룹화 후 반환 (`[{"target_date": "2025-01-01", "partitions": [...]}, ...]`)
 - `swap_refresh_task`는 날짜 수만큼 동적 확장됨 (UI에서 `[0]`, `[1]`, ... 블록으로 표시)
 
@@ -127,16 +136,14 @@ load_refresh_flags_task
 | `log_before_count_task` | 3 | 10s | |
 | `livy_task` | 3 | 3min | Spark 작업 제출/대기 |
 | `check_new_file_task` | 없음 | - | 같은 HDFS 상태를 재검사할 뿐이라 retry 무의미 (일별 DAG 전용) |
+| `check_execute_date_task` | 없음 | - | 순수 로직 비교라 retry 무의미 (월별 DAG 전용, 운영/소급 공통) |
 | `swap_refresh_task` | 없음 | - | retry 안전성은 temp 경로 체크로 보장 |
 
 ## 월별 DAG 동시 실행 제한
 
-`max_active_tis_per_dag` 파라미터로 태스크별 동시 실행 수를 제한. (Airflow 2.2+, 외부 리소스 생성 불필요)
-
-| 태스크 | max_active_tis_per_dag | 설명 |
-|---|---|---|
-| `livy_task` | 5 | 동시 처리 테이블 수 제한 (Livy가 테이블당 가장 오래 실행되는 태스크) |
-| `swap_refresh_task` | 10 | 날짜별 동적 확장 인스턴스 동시 실행 수 제한 |
+`max_active_tis_per_dagrun`이 태스크 단위로 기대대로 동작하지 않는 것이 확인되어 사용하지 않는다.
+대신 DAG 단위 `max_active_tasks=10`으로 동시 실행 테이블 수를 제어한다 (운영용/소급용 공통,
+`create_monthly_dag()` 팩토리의 `@dag(...)` 데코레이터에서 설정).
 
 ## HDFS 경로 구조
 
@@ -202,6 +209,7 @@ DOMAIN_PATH_MAP = {
 ## 주의사항
 
 - 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요 (월별은 새벽 1시, 일별은 2시·3시 등으로 분리)
+- 소급용(Backfill) DAG를 수동 트리거할 때는 운영용 DAG와 동일 테이블이 같은 날 동시에 실행되지 않도록 주의
 - 동일 테이블이 여러 Variable에 중복 등록되지 않도록 운영 관리 필요
 - `DOMAIN_PATH_MAP` 수정 시 `merge_daily_dag.py`와 `merge_monthly_dag.py` 두 파일 모두 반영
 - `livy_task`에서 `create_livy_batch` 후 `time.sleep(5)` 후 ID 조회 — Livy 등록 지연 대응
