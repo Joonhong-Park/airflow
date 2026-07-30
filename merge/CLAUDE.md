@@ -7,7 +7,7 @@
 | 파일 | 역할 |
 |---|---|
 | `merge_daily_dag.py` | 일별 병합 DAG (`Small-File-Merge-Daily-2am`, `3am`, ...) |
-| `merge_monthly_dag.py` | 월별 병합 DAG (운영용 `Small-File-Merge-Monthly`, 소급용 `Backfill-Day1`, `Day2`, ...) |
+| `merge_monthly_dag.py` | 월별 병합 DAG (운영용 `Small-File-Merge-Monthly`, 소급용 `Small-File-Merge-Monthly-Retro`) |
 
 ## 등록된 DAG 목록
 
@@ -16,8 +16,7 @@
 | `Small-File-Merge-Daily-2am` | `0 2 * * *` | `daily_table_2am_config` |
 | `Small-File-Merge-Daily-3am` | `0 3 * * *` | `daily_table_3am_config` |
 | `Small-File-Merge-Monthly` (운영용) | `0 1 * * *` | `monthly_merge_table_config` |
-| `Small-File-Merge-Monthly-Backfill-Day1` (소급용, 수동 트리거) | 없음 (`schedule=None`) | `monthly_merge_table_config_backfill_day1` |
-| `Small-File-Merge-Monthly-Backfill-Day2` (소급용, 수동 트리거) | 없음 (`schedule=None`) | `monthly_merge_table_config_backfill_day2` |
+| `Small-File-Merge-Monthly-Retro` (소급용, 수동 트리거) | 없음 (`schedule=None`) | `monthly_merge_table_config_retro` |
 
 새 DAG 추가 시 각 파일 하단의 `create_daily_dag()` / `create_monthly_dag()` / `create_monthly_backfill_dag()` 한 줄 추가.
 
@@ -46,7 +45,7 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
 | `refresh_flags` | JSON array | 클러스터별 refresh 실행 여부 (`[{"cluster": "...", "flag": true}]`) |
 | `daily_table_{H}am_config` | JSON array | 일별 병합 테이블 설정 (H시 실행, 예: 2am, 3am) |
 | `monthly_merge_table_config` | JSON array | 운영용 월별 병합 테이블 설정 (매일 실행, execute_date로 대상 필터링) |
-| `monthly_merge_table_config_backfill_day{N}` | JSON array | 소급용 월별 병합 테이블 설정 (수동 트리거 전용, N=1,2,3,...) |
+| `monthly_merge_table_config_retro` | JSON array | 소급용 월별 병합 테이블 설정 (수동 트리거 전용, day 구분 없이 단일 Variable) |
 
 ## 테이블 설정 스키마
 
@@ -61,7 +60,7 @@ max_active_runs=1       # 동일 DAG 중복 실행 방지
   }
 ]
 
-// monthly_merge_table_config (운영용) / monthly_merge_table_config_backfill_day1 / day2 / ... (소급용)
+// monthly_merge_table_config (운영용) / monthly_merge_table_config_retro (소급용)
 [
   {
     "table_id": 1,
@@ -209,7 +208,7 @@ DOMAIN_PATH_MAP = {
 ## 주의사항
 
 - 일별/월별 DAG가 동일 테이블을 동시에 실행하지 않도록 스케줄 관리 필요 (월별은 새벽 1시, 일별은 2시·3시 등으로 분리)
-- 소급용(Backfill) DAG를 수동 트리거할 때는 운영용 DAG와 동일 테이블이 같은 날 동시에 실행되지 않도록 주의
+- 소급용(`Small-File-Merge-Monthly-Retro`) DAG를 수동 트리거할 때는 운영용 DAG와 동일 테이블이 같은 날 동시에 실행되지 않도록 주의
 - 동일 테이블이 여러 Variable에 중복 등록되지 않도록 운영 관리 필요
 - `DOMAIN_PATH_MAP` 수정 시 `merge_daily_dag.py`와 `merge_monthly_dag.py` 두 파일 모두 반영
 - `livy_task`에서 `create_livy_batch` 후 `time.sleep(5)` 후 ID 조회 — Livy 등록 지연 대응

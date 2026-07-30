@@ -8,8 +8,7 @@ Small File Merge Monthly DAG
     운영용 (Small-File-Merge-Monthly): 매일 새벽 1시 실행되는 단일 DAG.
         테이블 설정의 execute_date(매월 실행일, 1~31)가 오늘과 일치하는 테이블만 병합하고
         나머지는 check_execute_date_task에서 skip 처리한다.
-    소급용 (Small-File-Merge-Monthly-Backfill-DayN): 수동 트리거 전용(schedule=None).
-        테이블이 많아 관리 편의를 위해 Day1/Day2...로 Variable을 나눠 등록한다.
+    소급용 (Small-File-Merge-Monthly-Retro): 수동 트리거 전용(schedule=None) 단일 DAG.
         운영용과 동일하게 execute_date 비교 로직을 거치므로, 특정 날짜에 강제로 실행하려면
         Airflow UI의 'Trigger DAG w/ config'로 logical date를 원하는 날짜로 지정한다.
 
@@ -749,9 +748,9 @@ def create_monthly_backfill_dag(dag_id, config_variable):
     트리거한다는 점만 다르다.
 
     Args:
-        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Monthly-Backfill-Day1'
+        dag_id (str): Airflow DAG ID. 예: 'Small-File-Merge-Monthly-Retro'
         config_variable (str): 테이블 설정을 담은 Airflow Variable 이름.
-                               예: 'monthly_merge_table_config_backfill_day1'
+                               예: 'monthly_merge_table_config_retro'
 
     Returns:
         DAG 인스턴스 (Airflow가 전역 스코프에서 자동 인식)
@@ -763,12 +762,9 @@ def create_monthly_backfill_dag(dag_id, config_variable):
 # DAG 목록
 # 운영용: 매일 실행되는 단일 DAG. 테이블별 execute_date로 실행일이 결정되므로
 #        DAG/Variable을 추가로 나눌 필요가 없다.
-# 소급용: 수동 트리거 전용. 테이블이 많아 관리 편의를 위해 Day1/Day2...로 Variable을
-#        나눠 등록한다. 동일 테이블이 여러 backfill Variable에 중복 등록되지 않도록
-#        운영 관리 필요.
+# 소급용: 수동 트리거 전용 단일 DAG(Retro). day별로 나누지 않고 하나의 Variable에서
+#        모든 소급 대상 테이블을 관리한다.
 # ─────────────────────────────────────────────────────────────────────────────
 create_monthly_dag('Small-File-Merge-Monthly', 'monthly_merge_table_config', '0 1 * * *')
 
-create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day1', 'monthly_merge_table_config_backfill_day1')
-create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day2', 'monthly_merge_table_config_backfill_day2')
-# create_monthly_backfill_dag('Small-File-Merge-Monthly-Backfill-Day3', 'monthly_merge_table_config_backfill_day3')
+create_monthly_backfill_dag('Small-File-Merge-Monthly-Retro', 'monthly_merge_table_config_retro')
